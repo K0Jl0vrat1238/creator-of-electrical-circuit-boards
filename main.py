@@ -377,8 +377,10 @@ class MainWindow(QMainWindow):
         form.addRow("Path simplify tolerance:", self.simplify_tolerance_mm)
 
         self.green_mode = QComboBox()
+        self.green_mode.addItem("По центру линий (Centerline)", userData="centerline") # <-- НОВЫЙ РЕЖИМ (по умолчанию)
         self.green_mode.addItem("Змейка (scanline)", userData="scanline")
-        self.green_mode.addItem("Contour offsets", userData="contour-offset")
+        self.green_mode.addItem("Контуры (contour-offset)", userData="contour-offset")
+        
         form.addRow("Режим гравировки зелёного:", self.green_mode)
         return group
 

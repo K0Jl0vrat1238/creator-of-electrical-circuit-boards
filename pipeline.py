@@ -10,8 +10,7 @@ from shapely.geometry import GeometryCollection, LineString, MultiPolygon, Point
 from shapely.ops import unary_union
 from skimage.morphology import skeletonize
 
-
-GreenMode = Literal["scanline", "contour-offset"]
+GreenMode = Literal["scanline", "contour-offset", "centerline"]
 
 
 class PipelineError(ValueError):
@@ -140,8 +139,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
 
 
 def _validate_config(config: PipelineConfig) -> None:
-    if config.green_mode not in {"scanline", "contour-offset"}:
-        raise PipelineError("Режим green должен быть scanline или contour-offset.")
+    if config.green_mode not in {"scanline", "contour-offset", "centerline"}:
+        raise PipelineError("Режим green должен быть scanline, contour-offset или centerline.")
 
     numeric_checks = {
         "Диаметр фрезы": config.tool_diameter_mm,
@@ -264,6 +263,12 @@ def _segment_color_masks(
             min_area = max(4, area // 45000)
             do_close = False
             do_open = True
+        elif name == "green":
+            # ИСПРАВЛЕНИЕ ДЛЯ ТЕКСТА:
+            # Уменьшаем минимальную площадь (чтобы не пропадали точки над 'i')
+            min_area = max(4, area // 45000)
+            do_close = True   # Склеиваем разорванные линии
+            do_open = False   # ЗАПРЕЩАЕМ удалять тонкие линии
         else:
             min_area = max(8, area // 22000)
             do_close = False
@@ -413,15 +418,39 @@ def _green_paths(
     simplify_tolerance_px: float,
 ) -> list[list[tuple[float, float]]]:
     work_mask = green_mask & (~hole_exclusion)
-    center_mask = _erode_for_tool_center(work_mask, tool_radius_px)
-    if not np.any(center_mask):
+
+    # Дополнительное склеивание микро-разрывов (характерно для неровного текста шелкографии)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    work_mask_u8 = (work_mask.astype(np.uint8) * 255)
+    work_mask_u8 = cv2.morphologyEx(work_mask_u8, cv2.MORPH_CLOSE, kernel)
+    work_mask = work_mask_u8 > 0
+
+    if not np.any(work_mask):
         return []
+
+    # НОВЫЙ ИДЕАЛЬНЫЙ РЕЖИМ ДЛЯ ТЕКСТА: 
+    # Сжимаем линии до толщины в 1 пиксель по центру и ведем по ним фрезу
+    if mode == "centerline":
+        skel = skeletonize(work_mask)
+        paths = _skeleton_to_polylines(skel)
+        return _simplify_paths(paths, simplify_tolerance_px)
+
+    # Старые алгоритмы: Scanline и Contour
+    center_mask = _erode_for_tool_center(work_mask, tool_radius_px)
+    
+    # Защита: Если текст тоньше фрезы, стандартная эрозия удалит его полностью.
+    # В таком случае мы отказываемся от эрозии, чтобы хоть что-то сгенерировать.
+    if not np.any(center_mask):
+        center_mask = work_mask
 
     if mode == "scanline":
         paths = _scanline_fill(center_mask, stepover_px)
-    else:
+    else: # contour-offset
         geom = _mask_to_geometry(center_mask)
         paths = _contour_offset_fill(geom, stepover_px)
+        # Если линия слишком тонкая для offset, просто обводим внешний контур
+        if not paths and not geom.is_empty:
+            paths = _polygon_boundary_paths(geom)
 
     return _simplify_paths(paths, simplify_tolerance_px)
 
