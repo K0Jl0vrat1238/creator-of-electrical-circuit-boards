@@ -209,6 +209,11 @@ def _resolve_mm_size(
 
 
 def _classify_color_masks(rgba: np.ndarray) -> dict[str, np.ndarray]:
+   # Обрабатываем изображения с разным количеством каналов
+   # Изменение
+    if rgba.ndim == 3 and rgba.shape[2] == 3:
+        rgba = np.dstack([rgba, np.full(rgba.shape[:2], 255, dtype=np.uint8)])
+    # Конец изменений
     rgb = rgba[:, :, :3].astype(np.uint8)
     alpha = rgba[:, :, 3].astype(np.uint8)
 
