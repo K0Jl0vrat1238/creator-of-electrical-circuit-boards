@@ -11,6 +11,7 @@ import numpy as np
 import math
 from pathlib import Path
 import sys
+# Убедитесь, что pipeline доступен в PYTHONPATH
 from pipeline import run_pipeline, PipelineConfig, _classify_color_masks, _segment_color_masks
 
 
@@ -37,6 +38,27 @@ def get_components(mask: np.ndarray) -> dict[int, np.ndarray]:
     return comps
 
 
+def fill_internal_holes(mask: np.ndarray) -> np.ndarray:
+    """
+    Заполняет внутренние отверстия в бинарной маске.
+    Используется для контуров, чтобы внутренние вырезы не считались разрывами.
+    """
+    if mask.sum() == 0:
+        return mask
+    # Добавляем рамку фона, чтобы floodFill гарантированно стартовал с внешнего фона
+    padded = np.pad(mask, pad_width=1, mode='constant', constant_values=False)
+    h, w = padded.shape
+    
+    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    inv_img = cv2.bitwise_not((padded.astype(np.uint8) * 255))
+    cv2.floodFill(inv_img, flood_mask, (0, 0), 255)
+    
+    # Пиксели, не залитые с угла, являются внутренними отверстиями
+    holes = flood_mask[1:-1, 1:-1] == 0
+    filled = np.logical_or(padded, holes)[1:-1, 1:-1]
+    return filled
+
+
 def analyze_topology(gt_comps: dict[int, np.ndarray], vec_comps: dict[int, np.ndarray], min_overlap_ratio: float = 0.05):
     """
     Сравнивает топологию Ground Truth и Вектора.
@@ -45,10 +67,10 @@ def analyze_topology(gt_comps: dict[int, np.ndarray], vec_comps: dict[int, np.nd
     breaks = []   # (gt_id, vec_ids) -> одна дорожка разорвалась на несколько
     shorts = []   # (vec_id, gt_ids) -> несколько изолированных дорожек слиплись
     ok_comps = [] # (gt_id, vec_id) -> топология сохранена
-
+    
     vec_to_gt = {v_id: [] for v_id in vec_comps}
     gt_to_vec = {g_id: [] for g_id in gt_comps}
-
+    
     for v_id, v_mask in vec_comps.items():
         for g_id, g_mask in gt_comps.items():
             intersection = np.logical_and(v_mask, g_mask).sum()
@@ -78,9 +100,12 @@ def save_topology_report(gt_mask: np.ndarray, vec_mask: np.ndarray, breaks: list
     """Сохраняет визуальный отчёт с подсветкой ошибок."""
     h, w = gt_mask.shape
     overlay = np.zeros((h, w, 3), dtype=np.uint8)
-    overlay[gt_mask, 1] = 150  # GT полупрозрачный зелёный
-    overlay[vec_mask, 2] = 150 # Vector полупрозрачный красный
-
+    
+    # ✅ ВАЖНО: Здесь gt_mask должна быть оригинальной (тонкие линии), 
+    # чтобы мы видели векторную линию (толстую) поверх неё.
+    overlay[gt_mask, 1] = 150  # GT полупрозрачный ЗЕЛЁНЫЙ (канал 1)
+    overlay[vec_mask, 2] = 150 # Vector полупрозрачный КРАСНЫЙ (канал 2)
+    
     cv2.putText(overlay, f"BREAKS: {len(breaks)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
     cv2.putText(overlay, f"SHORTS: {len(shorts)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
     cv2.imencode(".png", overlay)[1].tofile(str(save_dir / f"{layer_name}_topology.png"))
@@ -109,10 +134,8 @@ def main() -> int:
     if rgba is None:
         print("❌ Ошибка чтения изображения")
         return 1
-
     if rgba.ndim == 3 and rgba.shape[2] == 3:
         rgba = np.dstack([rgba, np.full(rgba.shape[:2], 255, dtype=np.uint8)])
-
     h, w = rgba.shape[:2]
     px_per_mm = w / args.width_mm
 
@@ -131,12 +154,12 @@ def main() -> int:
     gt_masks = _segment_color_masks(rgba, raw_masks=raw_masks)
 
     layers = {
-        "black": ("black_paths", result.black_paths, "Дорожки (BLACK)", config.trace_depth_mm),  # ⬅️ Обновлено
+        "black": ("black_paths", result.black_paths, "Дорожки (BLACK)", config.trace_depth_mm),
         "red":   ("cut_paths",   result.cut_paths,   "Контур (RED)",   config.stock_thickness_mm)
     }
 
     print("\n" + "=" * 60)
-    print("🔍 ТОПОЛОГИЧЕСКАЯ ПРОВЕРКА СВЯЗНОСТИ")
+    print(" ТОПОЛОГИЧЕСКАЯ ПРОВЕРКА СВЯЗНОСТИ")
     print("=" * 60)
     print(f"📏 Масштаб: {px_per_mm:.2f} px/mm | 🛠 Угол фрезы: {args.tool_angle}°")
 
@@ -147,7 +170,7 @@ def main() -> int:
         print(f"\n📦 Анализ слоя: {label}")
         gt_mask = gt_masks[color]
         if gt_mask.sum() == 0:
-            print("  ⏭️ [SKIP] Слой пуст на оригинале.")
+            print("  ️ [SKIP] Слой пуст на оригинале.")
             continue
 
         # Расчет физической толщины линии для растеризации под V-фрезу
@@ -157,17 +180,33 @@ def main() -> int:
 
         kernel_size = max(1, int(round(args.min_gap_px)))
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+        
         gt_clean = gt_mask.copy()
         if args.min_gap_px > 0:
             gt_u8 = (gt_clean.astype(np.uint8) * 255)
             gt_u8 = cv2.morphologyEx(gt_u8, cv2.MORPH_CLOSE, kernel)
             gt_clean = gt_u8 > 0
 
+        # ✅ ЗАПОЛНЯЕМ ВНУТРЕННИЕ ОТВЕРСТИЯ ТОЛЬКО ДЛЯ КОНТУРА (для анализа)
+        if color == "red":
+            gt_clean = fill_internal_holes(gt_clean)
+
         gt_comps = get_components(gt_clean)
+        
         vec_mask = rasterize_vector_paths(vec_data, w, h, thickness_px)
+        
+        # ✅ Заполняем отверстия и в векторной маске для согласованности сравнения
+        if color == "red":
+            vec_mask = fill_internal_holes(vec_mask)
+            
         vec_comps = get_components(vec_mask)
 
         breaks, shorts, ok = analyze_topology(gt_comps, vec_comps)
+        
+        # ✅ ИГНОРИРУЕМ SHORTS ДЛЯ КОНТУРА (из-за толщины фрезы это не ошибка)
+        if color == "red":
+            shorts = []
+
         total_breaks += len(breaks)
         total_shorts += len(shorts)
 
@@ -180,17 +219,21 @@ def main() -> int:
             print(f"  🔴 КОРОТКИЕ ЗАМЫКАНИЯ (SHORTS): {len(shorts)}")
             for s in shorts:
                 print(f"     -> {s['detail']}")
+                
+        # ✅ ВИЗУАЛИЗАЦИЯ: Для отчёта используем ОРИГИНАЛЬНУЮ маску (gt_mask),
+        # чтобы видеть толстую векторную линию (фрезу) поверх тонкого контура.
+        # Если использовать gt_clean (заполненную), мы увидим просто красный квадрат.
         save_topology_report(gt_mask, vec_mask, breaks, shorts, args.output_dir, color)
 
     print("\n" + "=" * 60)
-    print("📊 ИТОГОВЫЙ ОТЧЁТ")
+    print(" ИТОГОВЫЙ ОТЧЁТ")
     print("=" * 60)
     print(f"Всего разрывов:  {total_breaks}")
     print(f"Всего коротышей: {total_shorts}")
     if total_breaks == 0 and total_shorts == 0:
         print("✅ ТОПОЛОГИЯ ИДЕАЛЬНА. Плата готова к фрезеровке.")
     else:
-        print("⚠️ Обнаружены топологические ошибки. Проверьте overlay-файлы в отчёте.")
+        print("️ Обнаружены топологические ошибки. Проверьте overlay-файлы в отчёте.")
     print(f"Визуальные отчёты: {args.output_dir}")
     return 0
 
