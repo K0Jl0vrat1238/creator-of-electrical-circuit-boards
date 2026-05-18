@@ -11,7 +11,6 @@ import numpy as np
 import math
 from pathlib import Path
 import sys
-# Убедитесь, что pipeline доступен в PYTHONPATH
 from pipeline import run_pipeline, PipelineConfig, _classify_color_masks, _segment_color_masks
 
 
@@ -41,20 +40,28 @@ def get_components(mask: np.ndarray) -> dict[int, np.ndarray]:
 def fill_internal_holes(mask: np.ndarray) -> np.ndarray:
     """
     Заполняет внутренние отверстия в бинарной маске.
-    Используется для контуров, чтобы внутренние вырезы не считались разрывами.
+    Превращает контур (линию) в сплошную область (блин).
+    Используется для определения "зоны" внутри контура и для анализа связности.
     """
     if mask.sum() == 0:
         return mask
+    
     # Добавляем рамку фона, чтобы floodFill гарантированно стартовал с внешнего фона
     padded = np.pad(mask, pad_width=1, mode='constant', constant_values=False)
     h, w = padded.shape
     
     flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    # Инвертируем: фон станет белым (255), объекты черными (0)
     inv_img = cv2.bitwise_not((padded.astype(np.uint8) * 255))
+    
+    # Заливаем фон белым цветом (255)
     cv2.floodFill(inv_img, flood_mask, (0, 0), 255)
     
-    # Пиксели, не залитые с угла, являются внутренними отверстиями
+    # Пиксели, которые НЕ были залиты (остались 0 в flood_mask) — это объекты + внутренние отверстия
+    # Там, где 0 в flood_mask — это всё, что не фон (т.е. сама деталь).
     holes = flood_mask[1:-1, 1:-1] == 0
+    
+    # Объединяем оригинал + найденную сплошную область
     filled = np.logical_or(padded, holes)[1:-1, 1:-1]
     return filled
 
@@ -96,19 +103,49 @@ def analyze_topology(gt_comps: dict[int, np.ndarray], vec_comps: dict[int, np.nd
     return breaks, shorts, ok_comps
 
 
-def save_topology_report(gt_mask: np.ndarray, vec_mask: np.ndarray, breaks: list, shorts: list, save_dir: Path, layer_name: str):
-    """Сохраняет визуальный отчёт с подсветкой ошибок."""
+def save_topology_report(gt_mask: np.ndarray, vec_mask: np.ndarray, breaks: list, shorts: list, save_dir: Path, layer_name: str, original_image: np.ndarray = None):
+    """
+    Сохраняет визуальный отчёт.
+    original_image: Исходное фото для подложки.
+    """
     h, w = gt_mask.shape
     overlay = np.zeros((h, w, 3), dtype=np.uint8)
     
-    # ✅ ВАЖНО: Здесь gt_mask должна быть оригинальной (тонкие линии), 
-    # чтобы мы видели векторную линию (толстую) поверх неё.
-    overlay[gt_mask, 1] = 150  # GT полупрозрачный ЗЕЛЁНЫЙ (канал 1)
-    overlay[vec_mask, 2] = 150 # Vector полупрозрачный КРАСНЫЙ (канал 2)
+    if layer_name == "red":
+        # ✅ ЛОГИКА ДЛЯ КОНТУРА:
+        # 1. Определяем "Зону" (внутренность контура) и красим в ЗЕЛЕНЫЙ
+        gt_filled = fill_internal_holes(gt_mask)
+        overlay[gt_filled, 1] = 150  # Green channel
+        
+        # 2. Красим Контур и Путь в КРАСНЫЙ
+        # Объединяем маску контура и векторный путь
+        red_mask = np.logical_or(gt_mask, vec_mask)
+        
+        # Убираем зеленый в зоне красного, чтобы контур был чистым красным
+        overlay[red_mask, 1] = 0     
+        overlay[red_mask, 2] = 200   # Red channel
+    else:
+        # ✅ ЛОГИКА ДЛЯ ДОРОЖЕК:
+        overlay[gt_mask, 1] = 150  # GT полупрозрачный зелёный
+        overlay[vec_mask, 2] = 150 # Vector полупрозрачный красный
     
+    # Текст отчёта
     cv2.putText(overlay, f"BREAKS: {len(breaks)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
     cv2.putText(overlay, f"SHORTS: {len(shorts)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-    cv2.imencode(".png", overlay)[1].tofile(str(save_dir / f"{layer_name}_topology.png"))
+    
+    # ✅ НАЛОЖЕНИЕ НА ФОТО С ПРОЗРАЧНОСТЬЮ
+    if original_image is not None:
+        # Берем только RGB каналы (игнорируем alpha если есть)
+        bg = original_image[..., :3]
+        
+        # Прозрачность: Overlay (30%) + Photo (70%)
+        # Можно настроить alpha: 0.1 - очень прозрачный оверлей, 0.5 - полупрозрачный
+        alpha = 0.7
+        blended = cv2.addWeighted(overlay, alpha, bg, 1.0 - alpha, 0)
+        cv2.imencode(".png", blended)[1].tofile(str(save_dir / f"{layer_name}_topology.png"))
+    else:
+        # Если фото не передано, сохраняем просто оверлей
+        cv2.imencode(".png", overlay)[1].tofile(str(save_dir / f"{layer_name}_topology.png"))
 
 
 def _calc_vbit_width_mm(depth_mm: float, angle_deg: float) -> float:
@@ -187,7 +224,7 @@ def main() -> int:
             gt_u8 = cv2.morphologyEx(gt_u8, cv2.MORPH_CLOSE, kernel)
             gt_clean = gt_u8 > 0
 
-        # ✅ ЗАПОЛНЯЕМ ВНУТРЕННИЕ ОТВЕРСТИЯ ТОЛЬКО ДЛЯ КОНТУРА (для анализа)
+        # ✅ ЗАПОЛНЯЕМ ВНУТРЕННИЕ ОТВЕРСТИЯ ДЛЯ АНАЛИЗА СВЯЗНОСТИ (чтобы контур считался одной деталью)
         if color == "red":
             gt_clean = fill_internal_holes(gt_clean)
 
@@ -203,7 +240,7 @@ def main() -> int:
 
         breaks, shorts, ok = analyze_topology(gt_comps, vec_comps)
         
-        # ✅ ИГНОРИРУЕМ SHORTS ДЛЯ КОНТУРА (из-за толщины фрезы это не ошибка)
+        # ✅ ИГНОРИРУЕМ SHORTS ДЛЯ КОНТУРА (для цельной платы это не ошибка)
         if color == "red":
             shorts = []
 
@@ -220,10 +257,8 @@ def main() -> int:
             for s in shorts:
                 print(f"     -> {s['detail']}")
                 
-        # ✅ ВИЗУАЛИЗАЦИЯ: Для отчёта используем ОРИГИНАЛЬНУЮ маску (gt_mask),
-        # чтобы видеть толстую векторную линию (фрезу) поверх тонкого контура.
-        # Если использовать gt_clean (заполненную), мы увидим просто красный квадрат.
-        save_topology_report(gt_mask, vec_mask, breaks, shorts, args.output_dir, color)
+        # ✅ СОХРАНЕНИЕ ОТЧЁТА С ИСХОДНЫМ ФОТО
+        save_topology_report(gt_mask, vec_mask, breaks, shorts, args.output_dir, color, original_image=rgba)
 
     print("\n" + "=" * 60)
     print(" ИТОГОВЫЙ ОТЧЁТ")
