@@ -1,33 +1,29 @@
-from __future__ import annotations
 
+from __future__ import annotations
 import shutil
 import sys
 import math
 from pathlib import Path
-
 import cv2
 import numpy as np
 from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal, QMimeData
 from PyQt5.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PyQt5.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox, 
-    QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, 
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QGraphicsPixmapItem, 
-    QGraphicsScene, QGraphicsView, QMainWindow, QMessageBox, QPushButton, 
+    QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
+    QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QGraphicsPixmapItem,
+    QGraphicsScene, QGraphicsView, QMainWindow, QMessageBox, QPushButton,
     QRadioButton, QStyleFactory, QTabWidget, QVBoxLayout, QWidget
 )
-
 from pipeline import PipelineConfig, PipelineError, PipelineResult, run_pipeline
-from svg_export import export_svg_bundle
+from svg_export import export_svg_bundle  
 
 
 class LayerComposerDialog(QDialog):
-    """Окно для выбора отдельных картинок-слоев и их склейки."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Сборка из отдельных слоев")
         self.setMinimumWidth(550)
-        
         layout = QVBoxLayout(self)
         
         grid = QGridLayout()
@@ -78,7 +74,6 @@ class PreviewView(QGraphicsView):
         self.setMinimumSize(640, 480)
         self.setDragMode(QGraphicsView.NoDrag)
         self.setStyleSheet("border: 1px solid #808080;")
-        
         self._zoom = 1.0
         self._panning = False
         self._pan_start = None
@@ -106,7 +101,7 @@ class PreviewView(QGraphicsView):
             self.fitInView(self.scene().sceneRect(), Qt.KeepAspectRatio)
             self._zoom = self.transform().m11()
 
-    def wheelEvent(self, event) -> None:  # type: ignore[override]
+    def wheelEvent(self, event) -> None:
         if not self.scene().items() or event.angleDelta().y() == 0:
             return
         
@@ -120,7 +115,7 @@ class PreviewView(QGraphicsView):
         self._zoom = next_zoom
         self._lod_timer.start(500)
 
-    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+    def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton and self.scene().items():
             self._panning = True
             self._pan_start = event.pos()
@@ -130,20 +125,18 @@ class PreviewView(QGraphicsView):
             return
         super().mousePressEvent(event)
 
-    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+    def mouseMoveEvent(self, event) -> None:
         if self._panning and self._pan_start is not None:
             delta = event.pos() - self._pan_start
             self._pan_start = event.pos()
-            
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
-            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
-            
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y()) 
             self._lod_timer.start(500)
             event.accept()
             return
         super().mouseMoveEvent(event)
 
-    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+    def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.LeftButton and self._panning:
             self._panning = False
             self._pan_start = None
@@ -156,7 +149,6 @@ class PreviewView(QGraphicsView):
 
 class LayerListWidget(QListWidget):
     orderChanged = pyqtSignal()
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setDragDropMode(QAbstractItemView.DragDrop)
@@ -167,7 +159,6 @@ class LayerListWidget(QListWidget):
         self.setDefaultDropAction(Qt.MoveAction) 
         self.setSelectionMode(QAbstractItemView.SingleSelection)
         self.setAlternatingRowColors(True)
-
         self._dragged_row: int | None = None
 
     def startDrag(self, supportedActions: Qt.DropActions) -> None:
@@ -187,7 +178,6 @@ class LayerListWidget(QListWidget):
             
             self.insertItem(target_row, item_to_move)
             self.setCurrentItem(item_to_move) 
-            
             self._dragged_row = None
             self.orderChanged.emit()
             return True
@@ -208,7 +198,6 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Фрезеровщик печатных плат")
         self.setMinimumSize(1140, 760)
-
         self._base_dir = Path(__file__).resolve().parent
         self._image_path: Path | None = None
         self._source_rgba: np.ndarray | None = None
@@ -274,12 +263,11 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(left, 1)
 
-        self.preview_label = PreviewView()
+        self.preview_label = PreviewView() 
         layout.addWidget(self.preview_label, 4)
 
     def _init_layer_list(self) -> None:
         self.layer_list.clear()
-        
         layers = [
             ("source", "Оригинал", True),
             ("holes", "Отверстия", True),
@@ -289,10 +277,9 @@ class MainWindow(QMainWindow):
         ]
         
         self.layer_list.blockSignals(True)
-        
         for key, title, checked in layers:
             item = QListWidgetItem(title)
-            item.setData(Qt.UserRole, key)
+            item.setData(Qt.UserRole, key) 
             item.setFlags(
                 Qt.ItemIsUserCheckable
                 | Qt.ItemIsDragEnabled
@@ -301,7 +288,6 @@ class MainWindow(QMainWindow):
             )
             item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
             self.layer_list.addItem(item)
-            
         self.layer_list.blockSignals(False)
         self._update_preview()
 
@@ -364,8 +350,8 @@ class MainWindow(QMainWindow):
         form = QFormLayout(group)
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
-        self.tool_diameter_mm = self._spin(0.01, 1000.0, 1.0, suffix=" мм")
-        form.addRow("Диаметр фрезы:", self.tool_diameter_mm)
+        self.tool_angle_deg = self._spin(0.1, 179.0, 30.0, suffix=" °")
+        form.addRow("Угол фрезы (град):", self.tool_angle_deg)
 
         self.drill_diameter_mm = self._spin(0.01, 1000.0, 0.8, suffix=" мм")
         form.addRow("Диаметр сверла:", self.drill_diameter_mm)
@@ -377,11 +363,11 @@ class MainWindow(QMainWindow):
         form.addRow("Path simplify tolerance:", self.simplify_tolerance_mm)
 
         self.green_mode = QComboBox()
-        self.green_mode.addItem("По центру линий (Centerline)", userData="centerline") # <-- НОВЫЙ РЕЖИМ (по умолчанию)
+        self.green_mode.addItem("По центру линий (Centerline)", userData="centerline")
         self.green_mode.addItem("Змейка (scanline)", userData="scanline")
         self.green_mode.addItem("Контуры (contour-offset)", userData="contour-offset")
-        
-        form.addRow("Режим гравировки зелёного:", self.green_mode)
+        form.addRow("Режим гравировки (Green):", self.green_mode)
+
         return group
 
     def _build_future_gcode_group(self) -> QGroupBox:
@@ -429,7 +415,6 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        
         self._load_image_state(Path(path))
 
     def _show_layer_composer(self) -> None:
@@ -448,90 +433,57 @@ class MainWindow(QMainWindow):
     def _compose_and_load_layers(self, paths_dict: dict[str, str]) -> None:
         images = {}
         max_w, max_h = 0, 0
-        
-        # 1. Читаем картинки, бинаризуем, чистим и ищем макс. размер
         for layer_name, path in paths_dict.items():
-            # ИСПРАВЛЕНИЕ: Читаем через numpy, чтобы обойти баг OpenCV с кириллицей
             raw = np.fromfile(path, dtype=np.uint8)
             img = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
-            
             if img is None:
                 continue
-            
-            # Автоматически определяем цвет фона (черный или белый) по углам
             corners = [int(img[0, 0]), int(img[0, -1]), int(img[-1, 0]), int(img[-1, -1])]
             if sum(corners) / 4.0 < 128:
-                # Фон черный - инвертируем (чтобы всё полезное стало темным)
                 img = cv2.bitwise_not(img)
-            
-            # Порог отсечения: всё темнее 150 - полезный контур, светлее - отбрасываем
             _, mask = cv2.threshold(img, 150, 255, cv2.THRESH_BINARY_INV)
-            
-            # Морфологическое открытие отсекает мелкий цифровой мусор (артефакты 1-2 пикс)
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            
-            h, w = mask.shape
+            h, w = mask.shape 
             if w > max_w: max_w = w
             if h > max_h: max_h = h
-            
             images[layer_name] = mask
 
         if not images:
-            raise ValueError("Не удалось прочитать ни один слой. Проверьте пути к файлам.")
+            raise ValueError("Не удалось прочитать ни один слой.")
 
-        # 2. Создаем чистый белый холст (формат RGBA)
         composed = np.full((max_h, max_w, 4), 255, dtype=np.uint8)
-
-        # Цвета по слоям (R, G, B, A)
         colors = {
             'green': [0, 255, 0, 255],
             'paths': [0, 0, 0, 255],
             'cut':   [255, 0, 0, 255],
             'holes': [0, 0, 255, 255]
         }
-
-        # 3. Накладываем слои по очереди, центрируя каждый
-        # Порядок наложения снизу вверх: зеленка -> дороги -> контур -> отверстия
         for layer_name in ['green', 'paths', 'cut', 'holes']:
             if layer_name in images:
                 mask = images[layer_name]
                 h, w = mask.shape
-                off_y = (max_h - h) // 2
-                off_x = (max_w - w) // 2
-                
+                off_y, off_x = (max_h - h) // 2, (max_w - w) // 2
                 roi = composed[off_y:off_y+h, off_x:off_x+w]
-                color_arr = np.array(colors[layer_name], dtype=np.uint8)
-                
-                # Закрашиваем там, где контент (mask == 255)
-                roi[mask == 255] = color_arr
+                roi[mask == 255] = np.array(colors[layer_name], dtype=np.uint8)
 
-        # 4. Сохраняем готовую картинку во временный файл и загружаем её
         out_path = self._base_dir / "composed_source.png"
-        
-        # OpenCV сохраняет в формате BGRA
-        composed_bgra = cv2.cvtColor(composed, cv2.COLOR_RGBA2BGRA)
-        
-        # ИСПРАВЛЕНИЕ: Сохраняем тоже через numpy/imencode, чтобы не споткнуться о кириллицу
-        is_success, buffer = cv2.imencode(".png", composed_bgra)
+        is_success, buffer = cv2.imencode(".png", cv2.cvtColor(composed, cv2.COLOR_RGBA2BGRA))
         if is_success:
             buffer.tofile(str(out_path))
         else:
-            raise ValueError("Не удалось закодировать собранное изображение PNG.")
+            raise ValueError("Ошибка кодирования PNG.")
         
         self._load_image_state(out_path)
-        self.status_label.setText("Слои успешно собраны и загружены.")
+        self.status_label.setText("Слои успешно собраны.")
 
     def _load_image_state(self, path: Path) -> None:
-        """Вспомогательная функция для обновления стейта приложения при загрузке картинки."""
         self._image_path = path
         self.image_path_edit.setText(str(path))
         self.status_label.setText("Картинка загружена.")
-
         self._source_rgba = self._load_rgba_image(self._image_path)
         self._source_qimage = self._numpy_rgba_to_qimage(self._source_rgba)
         self._last_result = None  
-        
         self._update_preview()
         self.preview_label.fit_to_scene() 
 
@@ -542,18 +494,14 @@ class MainWindow(QMainWindow):
         if self._image_path is None:
             raise PipelineError("Сперва выберите исходную картинку.")
 
-        if self.width_radio.isChecked():
-            width_mm = float(self.width_mm.value())
-            height_mm = None
-        else:
-            width_mm = None
-            height_mm = float(self.height_mm.value())
+        width_mm = float(self.width_mm.value()) if self.width_radio.isChecked() else None
+        height_mm = float(self.height_mm.value()) if not self.width_radio.isChecked() else None
 
         return PipelineConfig(
             image_path=self._image_path,
             width_mm=width_mm,
             height_mm=height_mm,
-            tool_diameter_mm=float(self.tool_diameter_mm.value()),
+            tool_angle_deg=float(self.tool_angle_deg.value()),
             drill_diameter_mm=float(self.drill_diameter_mm.value()),
             stepover_percent=float(self.stepover_percent.value()),
             simplify_tolerance_mm=float(self.simplify_tolerance_mm.value()),
@@ -585,7 +533,7 @@ class MainWindow(QMainWindow):
         except PipelineError as exc:
             self.status_label.setText("Ошибка генерации.")
             QMessageBox.critical(self, "Error", str(exc))
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:
             self.status_label.setText("Ошибка.")
             QMessageBox.critical(self, "Error", f"Ошибка: {exc}")
 
@@ -607,6 +555,7 @@ class MainWindow(QMainWindow):
                 pixmap = QPixmap.fromImage(source_img)
                 item = scene.addPixmap(pixmap)
                 item.setTransformationMode(Qt.SmoothTransformation)
+                item.setOpacity(0.3)  # Снизили яркость оригинала, чтобы векторы были виднее
                 continue
                 
             if result is None:
@@ -620,11 +569,11 @@ class MainWindow(QMainWindow):
                     scene.addEllipse(hole.x_px - r, hole.y_px - r, r * 2, r * 2, pen, brush)
                     
             elif layer_key == "green":
-                self._add_paths_to_scene(scene, result.green_paths, QColor(0, 170, 0, 190), 2)
+                self._add_paths_to_scene(scene, result.green_paths, QColor(0, 200, 0, 255), result.green_tool_radius_px * 2)
             elif layer_key == "paths":
-                self._add_paths_to_scene(scene, result.paths_paths, QColor(20, 20, 20, 220), 2)
+                self._add_paths_to_scene(scene, result.black_paths, QColor(20, 20, 20, 255), result.black_tool_radius_px * 2)
             elif layer_key == "cut":
-                self._add_paths_to_scene(scene, result.cut_paths, QColor(220, 20, 20, 220), 2)
+                self._add_paths_to_scene(scene, result.cut_paths, QColor(255, 0, 0, 255), result.cut_tool_radius_px * 2)
 
         if scene.items():
             scene.setSceneRect(scene.itemsBoundingRect())
@@ -634,8 +583,9 @@ class MainWindow(QMainWindow):
         scene: QGraphicsScene,
         paths: list[list[tuple[float, float]]],
         color: QColor,
-        width: int,
+        width: float,
     ) -> None:
+        """Отрисовка в 2 слоя: толстая полупрозрачная линия + тонкая направляющая."""
         if not paths:
             return
             
@@ -647,12 +597,21 @@ class MainWindow(QMainWindow):
             for x, y in polyline[1:]:
                 qpath.lineTo(QPointF(x, y))
 
-        pen = QPen(color)
-        pen.setWidth(width)
-        pen.setCosmetic(True)  
-        pen.setCapStyle(Qt.RoundCap)
-        pen.setJoinStyle(Qt.RoundJoin)
-        scene.addPath(qpath, pen)
+        # 1. ТОЛСТАЯ линия (физический рез фрезы) - полупрозрачная
+        thick_color = QColor(color)
+        thick_color.setAlpha(90)  # прозрачность 
+        pen_thick = QPen(thick_color)
+        pen_thick.setWidthF(max(1.0, float(width)))
+        pen_thick.setCosmetic(False) # Отключаем косметику - масштабируется при зуме!
+        pen_thick.setCapStyle(Qt.RoundCap)
+        pen_thick.setJoinStyle(Qt.RoundJoin)
+        scene.addPath(qpath, pen_thick)
+
+        # 2. ТОНКАЯ линия (центр фрезы / вектор SVG) - яркая
+        pen_thin = QPen(color)
+        pen_thin.setWidthF(0)  # ширина 0 = ровно 1 пиксель всегда (косметически)
+        pen_thin.setCosmetic(True)
+        scene.addPath(qpath, pen_thin)
 
     def _layer_state(self) -> list[tuple[str, bool]]:
         state: list[tuple[str, bool]] = []
@@ -674,95 +633,37 @@ class MainWindow(QMainWindow):
         image = cv2.imdecode(raw, cv2.IMREAD_UNCHANGED)
         if image is None:
             raise PipelineError("Не удалось загрузить картинку.")
-        if image.ndim == 2:
-            return cv2.cvtColor(image, cv2.COLOR_GRAY2RGBA)
-        if image.ndim == 3 and image.shape[2] == 3:
-            return cv2.cvtColor(image, cv2.COLOR_BGR2RGBA)
-        if image.ndim == 3 and image.shape[2] == 4:
-            return cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
-        raise PipelineError("Неподдерживаемый формат изображения.")
+        if image.ndim == 2: return cv2.cvtColor(image, cv2.COLOR_GRAY2RGBA)
+        if image.ndim == 3 and image.shape[2] == 3: return cv2.cvtColor(image, cv2.COLOR_BGR2RGBA)
+        if image.ndim == 3 and image.shape[2] == 4: return cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
+        raise PipelineError("Неподдерживаемый формат.")
 
     @staticmethod
     def _numpy_rgba_to_qimage(rgba: np.ndarray) -> QImage:
         arr = np.ascontiguousarray(rgba)
         h, w = arr.shape[:2]
-        qimg = QImage(arr.data, w, h, w * 4, QImage.Format_RGBA8888)
-        return qimg.copy()
-
+        return QImage(arr.data, w, h, w * 4, QImage.Format_RGBA8888).copy()
 
 def build_stylesheet() -> str:
     return """
-QWidget {
-    background-color: #c0c0c0;
-    color: #000000;
-    font-family: "MS Sans Serif", "Tahoma", sans-serif;
-    font-size: 11px;
-}
-QMainWindow {
-    background-color: #c0c0c0;
-}
-QTabWidget::pane {
-    border: 1px solid #7f7f7f;
-    top: -1px;
-}
-QTabBar::tab {
-    background: #c0c0c0;
-    border: 1px solid #7f7f7f;
-    padding: 4px 10px;
-}
-QTabBar::tab:selected {
-    background: #d6d6d6;
-}
-QGroupBox {
-    border: 1px solid #7f7f7f;
-    margin-top: 10px;
-    padding-top: 10px;
-    font-weight: bold;
-}
-QGroupBox::title {
-    left: 8px;
-    top: -2px;
-    padding: 0 3px;
-}
-QLineEdit, QDoubleSpinBox, QComboBox, QListWidget {
-    background-color: #ffffff;
-    border: 1px solid #808080;
-    padding: 2px 4px;
-}
-QPushButton {
-    background-color: #c0c0c0;
-    border-top: 2px solid #ffffff;
-    border-left: 2px solid #ffffff;
-    border-right: 2px solid #404040;
-    border-bottom: 2px solid #404040;
-    min-height: 20px;
-    padding: 2px 10px;
-}
-QPushButton:pressed {
-    border-top: 2px solid #404040;
-    border-left: 2px solid #404040;
-    border-right: 2px solid #ffffff;
-    border-bottom: 2px solid #ffffff;
-}
-QLabel#statusLabel {
-    background-color: #ffffff;
-    border: 1px solid #808080;
-    padding: 4px;
-}
+QWidget { background-color: #c0c0c0; color: #000000; font-family: "MS Sans Serif", sans-serif; font-size: 11px; }
+QTabWidget::pane { border: 1px solid #7f7f7f; top: -1px; }
+QTabBar::tab { background: #c0c0c0; border: 1px solid #7f7f7f; padding: 4px 10px; }
+QTabBar::tab:selected { background: #d6d6d6; }
+QGroupBox { border: 1px solid #7f7f7f; margin-top: 10px; padding-top: 10px; font-weight: bold; }
+QGroupBox::title { left: 8px; top: -2px; padding: 0 3px; }
+QLineEdit, QDoubleSpinBox, QComboBox, QListWidget { background-color: #ffffff; border: 1px solid #808080; padding: 2px 4px; }
+QPushButton { background-color: #c0c0c0; border-top: 2px solid #ffffff; border-left: 2px solid #ffffff; border-right: 2px solid #404040; border-bottom: 2px solid #404040; min-height: 20px; padding: 2px 10px; }
+QPushButton:pressed { border-top: 2px solid #404040; border-left: 2px solid #404040; border-right: 2px solid #ffffff; border-bottom: 2px solid #ffffff; }
 """
-
 
 def main() -> int:
     app = QApplication(sys.argv)
-    available_styles = {name.lower() for name in QStyleFactory.keys()}
-    if "windows" in available_styles:
-        app.setStyle("windows")
+    if "windows" in {name.lower() for name in QStyleFactory.keys()}: app.setStyle("windows")
     app.setStyleSheet(build_stylesheet())
-
     window = MainWindow()
     window.show()
     return app.exec_()
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
