@@ -528,14 +528,24 @@ class MainWindow(QMainWindow):
             self._update_preview()
 
             self.status_label.setText("SVG сгенерировано.")
-            details = "\n".join(str(path) for path in files.values())
-            QMessageBox.information(self, "Готово", "Файлы созданы:\n\n" + details)
+            
+            # Формирование отчета
+            details = "Созданные файлы:\n" + "\n".join(f"- {path.name}" for path in files.values())
+            
+            # Добавление предупреждений, если они есть
+            if result.warnings:
+                warnings_text = "\n\n⚠️ Внимание (некритично):\n" + "\n".join(f"• {w}" for w in result.warnings)
+            else:
+                warnings_text = ""
+
+            QMessageBox.information(self, "Успешно завершено", details + warnings_text)
+            
         except PipelineError as exc:
             self.status_label.setText("Ошибка генерации.")
-            QMessageBox.critical(self, "Error", str(exc))
+            QMessageBox.critical(self, "Ошибка", str(exc))
         except Exception as exc:
             self.status_label.setText("Ошибка.")
-            QMessageBox.critical(self, "Error", f"Ошибка: {exc}")
+            QMessageBox.critical(self, "Ошибка", f"Непредвиденная ошибка: {exc}")
 
     def _update_preview(self) -> None:
         scene = self.preview_label.scene()

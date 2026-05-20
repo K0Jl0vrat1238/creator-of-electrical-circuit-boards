@@ -1,10 +1,7 @@
 from __future__ import annotations
-
 from pathlib import Path
 import xml.etree.ElementTree as ET
-
 from pipeline import PipelineResult
-
 
 SVG_NS = "http://www.w3.org/2000/svg"
 ET.register_namespace("", SVG_NS)
@@ -12,28 +9,36 @@ ET.register_namespace("", SVG_NS)
 
 def export_svg_bundle(result: PipelineResult, output_dir: Path) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    files = {
-        "holes.svg": _write_holes_svg(result, output_dir / "holes.svg"),
-        "green.svg": _write_paths_svg(
+    files = {}
+    
+    # Экспортируем файлы только для тех слоев, которые содержат данные
+    if result.holes:
+        files["holes.svg"] = _write_holes_svg(result, output_dir / "holes.svg")
+        
+    if result.green_paths:
+        files["green.svg"] = _write_paths_svg(
             result,
             result.green_paths,
             output_dir / "green.svg",
             stroke="#00a000",
-        ),
-        "paths.svg": _write_paths_svg(
+        )
+        
+    if result.black_paths:
+        files["paths.svg"] = _write_paths_svg(
             result,
-            result.paths_paths,
+            result.black_paths,
             output_dir / "paths.svg",
             stroke="#222222",
-        ),
-        "cut.svg": _write_paths_svg(
+        )
+        
+    if result.cut_paths:
+        files["cut.svg"] = _write_paths_svg(
             result,
             result.cut_paths,
             output_dir / "cut.svg",
             stroke="#cc0000",
-        ),
-    }
+        )
+        
     return files
 
 

@@ -49,12 +49,123 @@ class PipelineResult:
     green_tool_radius_px: float
     black_tool_radius_px: float
     cut_tool_radius_px: float
+    warnings: list[str]
 
 def _calc_effective_radius_mm(depth_mm: float, angle_deg: float) -> float:
     """Эффективный радиус V-фрезы: r = depth * tan(angle/2)"""
     if depth_mm <= 0 or angle_deg <= 0 or angle_deg >= 180:
         return 0.0
     return depth_mm * math.tan(math.radians(angle_deg / 2.0))
+
+
+# --- Вспомогательные функции топологического анализа ---
+
+def _rasterize_vector_paths(paths: list[list[tuple[float, float]]], width: int, height: int, thickness_px: int) -> np.ndarray:
+    mask = np.zeros((height, width), dtype=np.uint8)
+    for path in paths:
+        if len(path) < 2:
+            continue
+        pts = np.array([[int(round(x)), int(round(y))] for x, y in path], np.int32).reshape((-1, 1, 2))
+        cv2.polylines(mask, [pts], isClosed=False, color=255, thickness=thickness_px, lineType=cv2.LINE_AA)
+    return mask > 0
+
+def _get_components(mask: np.ndarray) -> dict[int, np.ndarray]:
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (mask.astype(np.uint8) * 255).astype(np.uint8), connectivity=8
+    )
+    comps = {}
+    for idx in range(1, num_labels):
+        if stats[idx, cv2.CC_STAT_AREA] > 5:
+            comps[idx] = labels == idx
+    return comps
+
+def _fill_internal_holes(mask: np.ndarray) -> np.ndarray:
+    if mask.sum() == 0:
+        return mask
+    padded = np.pad(mask, pad_width=1, mode='constant', constant_values=False)
+    h, w = padded.shape
+    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    inv_img = cv2.bitwise_not((padded.astype(np.uint8) * 255))
+    cv2.floodFill(inv_img, flood_mask, (0, 0), 255)
+    holes = flood_mask[1:-1, 1:-1] == 0
+    return np.logical_or(padded, holes)[1:-1, 1:-1]
+
+def _analyze_topology_internal(gt_comps: dict[int, np.ndarray], vec_comps: dict[int, np.ndarray], min_overlap_ratio: float = 0.05):
+    breaks = []
+    shorts = []
+    vec_to_gt = {v_id: [] for v_id in vec_comps}
+    gt_to_vec = {g_id: [] for g_id in gt_comps}
+    for v_id, v_mask in vec_comps.items():
+        for g_id, g_mask in gt_comps.items():
+            intersection = np.logical_and(v_mask, g_mask).sum()
+            gt_area = g_mask.sum()
+            if gt_area > 0 and intersection > min_overlap_ratio * gt_area:
+                vec_to_gt[v_id].append(g_id)
+                gt_to_vec[g_id].append(v_id)
+    for g_id, v_ids in gt_to_vec.items():
+        if len(v_ids) == 0:
+            breaks.append(f"Дорожка #{g_id} полностью потеряна.")
+        elif len(v_ids) > 1:
+            breaks.append(f"Дорожка #{g_id} разорвана на {len(v_ids)} частей.")
+    for v_id, g_ids in vec_to_gt.items():
+        if len(g_ids) > 1:
+            shorts.append(f"Замыкание: непреднамеренное объединение дорожек {g_ids}.")
+    return breaks, shorts
+
+def _validate_topology_and_collisions(
+    gt_masks: dict[str, np.ndarray],
+    black_paths: list[list[tuple[float, float]]],
+    cut_paths: list[list[tuple[float, float]]],
+    width_px: int,
+    height_px: int,
+    black_radius_px: float,
+    cut_radius_px: float
+) -> None:
+    errors = []
+
+    # 1. Валидация дорожек (BLACK)
+    gt_black = gt_masks.get("black")
+    if gt_black is not None and gt_black.sum() > 0:
+        thickness_px = max(1, int(round(black_radius_px * 2)))
+        vec_black_mask = _rasterize_vector_paths(black_paths, width_px, height_px, thickness_px)
+        gt_comps = _get_components(gt_black)
+        vec_comps = _get_components(vec_black_mask)
+        breaks, shorts = _analyze_topology_internal(gt_comps, vec_comps)
+        errors.extend(breaks)
+        errors.extend(shorts)
+
+    # 2. Валидация контура реза (RED)
+    gt_red = gt_masks.get("red")
+    if gt_red is not None and gt_red.sum() > 0:
+        thickness_px = max(1, int(round(cut_radius_px * 2)))
+        vec_red_mask = _rasterize_vector_paths(cut_paths, width_px, height_px, thickness_px)
+        gt_comps = _get_components(gt_red)
+        vec_red_filled = _fill_internal_holes(vec_red_mask)
+        vec_comps = _get_components(vec_red_filled)
+        breaks, _ = _analyze_topology_internal(gt_comps, vec_comps)
+        if breaks:
+            errors.extend([f"Ошибка контура платы: {b}" for b in breaks])
+
+    # 3. Валидация пересечений контура (RED) и дорожек (BLACK)
+    if gt_black is not None and gt_black.sum() > 0:
+        thickness_px = max(1, int(round(cut_radius_px * 2)))
+        vec_red_mask = _rasterize_vector_paths(cut_paths, width_px, height_px, thickness_px)
+        overlap = np.logical_and(gt_black, vec_red_mask)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            (overlap.astype(np.uint8) * 255), connectivity=8
+        )
+        collisions = 0
+        for i in range(1, num_labels):
+            if stats[i, cv2.CC_STAT_AREA] > 3:
+                collisions += 1
+        if collisions > 0:
+            errors.append(f"Коллизия: обнаружено {collisions} пересечений контурной фрезы с дорожками.")
+
+    if errors:
+        raise PipelineError("Обнаружены критические дефекты трассировки:\n\n" + "\n".join(errors))
+
+
+# --- Основной конвейер ---
 
 def run_pipeline(config: PipelineConfig) -> PipelineResult:
     _validate_config(config)
@@ -110,17 +221,39 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         tool_radius_px=black_tool_radius_px,
         simplify_tolerance_px=simplify_tolerance_px,
     )
-    if not black_paths:
-        raise PipelineError("Не удалось построить траектории для paths.svg: черная геометрия пуста.")
 
-    # Вызов построения контура строго по линии (без смещения)
     cut_paths = _cut_paths(
         masks["red"],
         simplify_tolerance_px=simplify_tolerance_px,
     )
-    if not cut_paths:
-        raise PipelineError("Не удалось построить траектории для cut.svg: красная геометрия пуста.")
 
+    warnings_list = []
+    if not holes:
+        warnings_list.append("Слой отверстий (Blue) не обнаружен.")
+    if not green_paths:
+        warnings_list.append("Слой текста/шелкографии (Green) не обнаружен.")
+    if not black_paths:
+        warnings_list.append("Слой проводящих дорожек (Black) не обнаружен.")
+    if not cut_paths:
+        warnings_list.append("Слой контура обрезки (Red) не обнаружен.")
+    
+    # Единая проверка: ошибка генерируется только если абсолютно все слои пусты
+    if not (holes or green_paths or black_paths or cut_paths):
+        raise PipelineError("Не найдено ни одного рабочего слоя (отверстия, текст, дорожки или контур).")
+
+    # Топологическая валидация (выполняется только для тех слоев, которые присутствуют на исходном изображении)
+    _validate_topology_and_collisions(
+        gt_masks=masks,
+        black_paths=black_paths,
+        cut_paths=cut_paths,
+        width_px=width_px,
+        height_px=height_px,
+        black_radius_px=black_tool_radius_px,
+        cut_radius_px=cut_tool_radius_px
+    )
+    
+    
+    
     return PipelineResult(
         width_px=width_px,
         height_px=height_px,
@@ -133,8 +266,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         green_tool_radius_px=green_tool_radius_px,
         black_tool_radius_px=black_tool_radius_px,
         cut_tool_radius_px=cut_tool_radius_px,
+        warnings=warnings_list,
     )
-
 def _validate_config(config: PipelineConfig) -> None:
     if config.green_mode not in {"scanline", "contour-offset", "centerline"}:
         raise PipelineError("Режим green должен быть scanline, contour-offset или centerline.")
@@ -294,8 +427,6 @@ def _cut_paths(
     if geom.is_empty:
         return []
 
-    # Мы больше не смещаем полигон (geom.buffer). 
-    # Внешняя граница нарисованной платы становится траекторией фрезы.
     paths: list[list[tuple[float, float]]] = []
     for poly in _iter_polygons(geom):
         ext = list(poly.exterior.coords)
