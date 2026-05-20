@@ -16,7 +16,8 @@ from PyQt5.QtWidgets import (
     QRadioButton, QStyleFactory, QTabWidget, QVBoxLayout, QWidget
 )
 from pipeline import PipelineConfig, PipelineError, PipelineResult, run_pipeline
-from svg_export import export_svg_bundle  
+from svg_export import export_svg_bundle
+from gerber_importer import render_gerber_and_excellon
 
 
 class LayerComposerDialog(QDialog):
@@ -57,6 +58,50 @@ class LayerComposerDialog(QDialog):
         path, _ = QFileDialog.getOpenFileName(
             self, f"Выберите слой: {key}", "", "Растровые форматы (*.jpg *.jpeg *.png *.bmp)"
         )
+        if path:
+            self.edits[key].setText(path)
+            
+    def get_paths(self) -> dict[str, str]:
+        return {k: edit.text() for k, edit in self.edits.items() if edit.text()}
+
+
+class GerberComposerDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Импорт Gerber / Excellon")
+        self.setMinimumWidth(550)
+        layout = QVBoxLayout(self)
+        
+        grid = QGridLayout()
+        layers_info = [
+            ('holes', 'Карта сверловки (.drl / .txt):'),
+            ('green', 'Шелкография (.gto / .gbo / .gbr):'),
+            ('paths', 'Проводящие дорожки (.gtl / .gbl / .gbr):'),
+            ('cut', 'Контур платы (.gko / .gbr):')
+        ]
+        
+        self.edits = {}
+        for row, (key, label_text) in enumerate(layers_info):
+            grid.addWidget(QLabel(label_text), row, 0)
+            edit = QLineEdit()
+            edit.setReadOnly(True)
+            self.edits[key] = edit
+            grid.addWidget(edit, row, 1)
+            
+            btn = QPushButton("Выбрать...")
+            btn.clicked.connect(lambda _, k=key: self._browse(k))
+            grid.addWidget(btn, row, 2)
+            
+        layout.addLayout(grid)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        
+    def _browse(self, key: str) -> None:
+        file_filter = "Координаты сверловки (*.drl *.txt *.xln)" if key == 'holes' else "Файлы Gerber (*.gbr *.gtl *.gbl *.gko *.gto *.gbo)"
+        path, _ = QFileDialog.getOpenFileName(self, f"Выберите файл для: {key}", "", file_filter)
         if path:
             self.edits[key].setText(path)
             
@@ -357,10 +402,10 @@ class MainWindow(QMainWindow):
         form.addRow("Диаметр сверла:", self.drill_diameter_mm)
 
         self.stepover_percent = self._spin(1.0, 100.0, 50.0, suffix=" %")
-        form.addRow("Stepover:", self.stepover_percent)
+        form.addRow("Разряженность:", self.stepover_percent)
 
         self.simplify_tolerance_mm = self._spin(0.0, 100.0, 0.0, suffix=" мм", decimals=4)
-        form.addRow("Path simplify tolerance:", self.simplify_tolerance_mm)
+        form.addRow("Грубость симплификации путей:", self.simplify_tolerance_mm)
 
         self.green_mode = QComboBox()
         self.green_mode.addItem("По центру линий (Centerline)", userData="centerline")
@@ -477,6 +522,36 @@ class MainWindow(QMainWindow):
         self._load_image_state(out_path)
         self.status_label.setText("Слои успешно собраны.")
 
+    def _show_gerber_stub(self) -> None:
+        dialog = GerberComposerDialog(self)
+        if dialog.exec_():
+            paths = dialog.get_paths()
+            if not paths:
+                return
+            
+            self.status_label.setText("Импортируем Gerber-файлы...")
+            QApplication.processEvents()
+            try:
+                layers_paths = {k: Path(v) for k, v in paths.items()}
+                composed, width_mm, height_mm = render_gerber_and_excellon(layers_paths)
+                
+                # Сохраняем временный PNG
+                out_path = self._base_dir / "composed_source.png"
+                is_success, buffer = cv2.imencode(".png", cv2.cvtColor(composed, cv2.COLOR_RGBA2BGRA))
+                if is_success:
+                    buffer.tofile(str(out_path))
+                else:
+                    raise ValueError("Ошибка кодирования временного PNG.")
+                
+                self._load_image_state(out_path)
+                self.width_radio.setChecked(True)
+                self.width_mm.setValue(width_mm)
+                self._sync_scale_mode()
+                self.status_label.setText(f"Gerber успешно импортирован. Размер: {width_mm:.2f} x {height_mm:.2f} мм")
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка импорта Gerber", f"Не удалось прочитать векторные файлы:\n{e}")
+                self.status_label.setText("Ошибка импорта Gerber.")
+    
     def _load_image_state(self, path: Path) -> None:
         self._image_path = path
         self.image_path_edit.setText(str(path))
@@ -486,9 +561,6 @@ class MainWindow(QMainWindow):
         self._last_result = None  
         self._update_preview()
         self.preview_label.fit_to_scene() 
-
-    def _show_gerber_stub(self) -> None:
-        QMessageBox.information(self, "Gerber", "ЛООООХ!!!! Нет гербера")
 
     def _build_config(self) -> PipelineConfig:
         if self._image_path is None:
