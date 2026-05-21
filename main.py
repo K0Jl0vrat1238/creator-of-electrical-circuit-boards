@@ -4,9 +4,11 @@ import shutil
 import sys
 import math
 import logging
+import argparse  # Парсер аргументов командной строки
 from pathlib import Path
 import cv2
 import numpy as np
+import yaml  # Импортируем PyYAML для загрузки конфигурации
 from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal, QMimeData
 from PyQt5.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PyQt5.QtWidgets import (
@@ -14,17 +16,15 @@ from PyQt5.QtWidgets import (
     QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QGraphicsPixmapItem,
     QGraphicsScene, QGraphicsView, QMainWindow, QMessageBox, QPushButton,
-    QRadioButton, QStyleFactory, QTabWidget, QVBoxLayout, QWidget
+    QRadioButton, QStyleFactory, QTabWidget, QVBoxLayout, QWidget, QCheckBox
 )
 from pipeline import PipelineConfig, PipelineError, PipelineResult, run_pipeline
 from svg_export import export_svg_bundle
 from gerber_importer import render_gerber_and_excellon
 
-# Инициализируем логгер для графического интерфейса
 logger = logging.getLogger("gui")
 
 def setup_logging(log_file_path: Path) -> None:
-    """Настройка глобальной конфигурации логирования (Консоль + Файл)."""
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
 
@@ -33,13 +33,11 @@ def setup_logging(log_file_path: Path) -> None:
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-    # Вывод в консоль (INFO и выше)
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
     root_logger.addHandler(console_handler)
 
-    # Запись в файл (DEBUG и выше)
     try:
         file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
         file_handler.setLevel(logging.DEBUG)
@@ -269,7 +267,7 @@ class LayerListWidget(QListWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, skip_validation: bool = False) -> None:
         super().__init__()
         self.setWindowTitle("Фрезеровщик печатных плат")
         self.setMinimumSize(1140, 760)
@@ -278,6 +276,8 @@ class MainWindow(QMainWindow):
         self._source_rgba: np.ndarray | None = None
         self._source_qimage: QImage | None = None
         self._last_result: PipelineResult | None = None
+        
+        self._initial_skip_validation = skip_validation
 
         self._build_ui()
         self._init_layer_list()
@@ -442,6 +442,11 @@ class MainWindow(QMainWindow):
         self.green_mode.addItem("Змейка (scanline)", userData="scanline")
         self.green_mode.addItem("Контуры (contour-offset)", userData="contour-offset")
         form.addRow("Режим гравировки (Green):", self.green_mode)
+        
+        self.skip_validation_checkbox = QCheckBox("Игнорировать ошибки трассировки и коллизии")
+        self.skip_validation_checkbox.setChecked(self._initial_skip_validation)
+        self.skip_validation_checkbox.setHidden(True)
+        form.addRow(self.skip_validation_checkbox)
 
         return group
 
@@ -600,6 +605,79 @@ class MainWindow(QMainWindow):
         self._update_preview()
         self.preview_label.fit_to_scene() 
 
+    def load_config_from_yaml(self, path: Path) -> None:
+        """Считывает настройки из YAML-файла и безопасно заполняет ими GUI."""
+        logger.info(f"Loading UI settings from YAML: {path.name}")
+        try:
+            content = path.read_text(encoding="utf-8")
+            data = yaml.safe_load(content)
+            if not data:
+                logger.warning("Empty or invalid YAML file.")
+                return
+            
+            # 1. Загрузка исходного изображения
+            img_path_str = data.get("source_image")
+            if img_path_str:
+                img_path = Path(img_path_str)
+                # Если путь относительный, пробуем разрешить его относительно папки с конфигом
+                if not img_path.is_absolute():
+                    resolved = (path.parent / img_path).resolve()
+                    if resolved.exists():
+                        img_path = resolved
+                
+                if img_path.exists():
+                    self._load_image_state(img_path)
+                    logger.info(f"Config loaded image: {img_path}")
+                else:
+                    logger.warning(f"Image path from config does not exist: {img_path_str}")
+
+            # 2. Физические размеры
+            dims = data.get("physical_dimensions", {})
+            resolved_from = dims.get("resolved_from", "width")
+            if resolved_from == "width" and "width_mm" in dims:
+                self.width_radio.setChecked(True)
+                self.width_mm.setValue(float(dims["width_mm"]))
+            elif resolved_from == "height" and "height_mm" in dims:
+                self.height_radio.setChecked(True)
+                self.height_mm.setValue(float(dims["height_mm"]))
+            self._sync_scale_mode()
+
+            # 3. Параметры инструментов
+            tools = data.get("tool_parameters", {})
+            if "angle_deg" in tools:
+                self.tool_angle_deg.setValue(float(tools["angle_deg"]))
+            if "drill_diameter_mm" in tools:
+                self.drill_diameter_mm.setValue(float(tools["drill_diameter_mm"]))
+            if "stepover_percent" in tools:
+                self.stepover_percent.setValue(float(tools["stepover_percent"]))
+            if "simplify_tolerance_mm" in tools:
+                self.simplify_tolerance_mm.setValue(float(tools["simplify_tolerance_mm"]))
+            if "green_mode" in tools:
+                mode_str = tools["green_mode"]
+                idx = self.green_mode.findData(mode_str)
+                if idx != -1:
+                    self.green_mode.setCurrentIndex(idx)
+
+            # 4. Параметры G-кода
+            gcode = data.get("gcode_generation", {})
+            if "stock_thickness_mm" in gcode:
+                self.stock_thickness_mm.setValue(float(gcode["stock_thickness_mm"]))
+            if "cut_speed_mm_s" in gcode:
+                self.cut_speed_mm_s.setValue(float(gcode["cut_speed_mm_s"]))
+            if "max_accel_mm_s2" in gcode:
+                self.max_accel_mm_s2.setValue(float(gcode["max_accel_mm_s2"]))
+            if "trace_depth_mm" in gcode:
+                self.trace_depth_mm.setValue(float(gcode["trace_depth_mm"]))
+            if "green_depth_mm" in gcode:
+                self.green_depth_mm.setValue(float(gcode["green_depth_mm"]))
+
+            logger.info("Successfully populated UI fields from YAML.")
+            self.status_label.setText(f"Конфиг {path.name} загружен.")
+            
+        except Exception as e:
+            logger.error(f"Failed to parse configuration YAML: {e}", exc_info=True)
+            self.status_label.setText("Ошибка разбора YAML.")
+
     def _build_config(self) -> PipelineConfig:
         if self._image_path is None:
             raise PipelineError("Сперва выберите исходную картинку.")
@@ -621,6 +699,7 @@ class MainWindow(QMainWindow):
             max_accel_mm_s2=float(self.max_accel_mm_s2.value()),
             trace_depth_mm=float(self.trace_depth_mm.value()),
             green_depth_mm=float(self.green_depth_mm.value()),
+            skip_validation=self.skip_validation_checkbox.isChecked()
         )
 
     def _generate(self) -> None:
@@ -630,35 +709,43 @@ class MainWindow(QMainWindow):
 
             config = self._build_config()
             out_dir = self._base_dir / "outputs"
+            
+            logger.info(f"Clearing output directory: {out_dir}")
             self._clear_output_dir(out_dir)
 
+            logger.info("Starting processing pipeline configuration...")
             result = run_pipeline(config)
             
-            # Передаем объект config вторым аргументом для записи YAML-файла
-            files = export_svg_bundle(result, config, out_dir) 
+            logger.info("Exporting paths into SVG bundles...")
+            files = export_svg_bundle(result, config, out_dir)
+            
             self._last_result = result
             self._update_preview()
 
             self.status_label.setText("SVG сгенерировано.")
+            logger.info(f"SVG bundle generation finalized. Created files count: {len(files)}")
             
             # Формирование отчета
             details = "Созданные файлы:\n" + "\n".join(f"- {path.name}" for path in files.values())
             
-            # Добавление предупреждений, если они есть
+            # Добавление предупреждений
             if result.warnings:
-                warnings_text = "\n\n⚠️ Внимание (некритично):\n" + "\n".join(f"• {w}" for w in result.warnings)
+                warnings_text = "\n\n⚠️ Предупреждения / Игнорируемые ошибки:\n" + "\n".join(f"• {w}" for w in result.warnings)
+                logger.warning(f"Pipeline finished with warnings: {result.warnings}")
             else:
                 warnings_text = ""
 
             QMessageBox.information(self, "Успешно завершено", details + warnings_text)
             
         except PipelineError as exc:
+            logger.warning(f"Pipeline domain validation failed: {exc}")
             self.status_label.setText("Ошибка генерации.")
             QMessageBox.critical(self, "Ошибка", str(exc))
         except Exception as exc:
+            logger.error("Critical error during pipeline execution", exc_info=True)
             self.status_label.setText("Ошибка.")
             QMessageBox.critical(self, "Ошибка", f"Непредвиденная ошибка: {exc}")
-            
+
     def _update_preview(self) -> None:
         scene = self.preview_label.scene()
         scene.clear()  
@@ -677,7 +764,7 @@ class MainWindow(QMainWindow):
                 pixmap = QPixmap.fromImage(source_img)
                 item = scene.addPixmap(pixmap)
                 item.setTransformationMode(Qt.SmoothTransformation)
-                item.setOpacity(0.3)  # Снизили яркость оригинала, чтобы векторы были виднее
+                item.setOpacity(0.3)
                 continue
                 
             if result is None:
@@ -719,19 +806,15 @@ class MainWindow(QMainWindow):
             for x, y in polyline[1:]:
                 qpath.lineTo(QPointF(x, y))
 
-        # 1. ТОЛСТАЯ линия (физический рез фрезы) - полупрозрачная
-        thick_color = QColor(color)
-        thick_color.setAlpha(90)  # прозрачность 
-        pen_thick = QPen(thick_color)
+        pen_thick = QPen(QColor(color.red(), color.green(), color.blue(), 90))
         pen_thick.setWidthF(max(1.0, float(width)))
-        pen_thick.setCosmetic(False) # Отключаем косметику - масштабируется при зуме!
+        pen_thick.setCosmetic(False)
         pen_thick.setCapStyle(Qt.RoundCap)
         pen_thick.setJoinStyle(Qt.RoundJoin)
         scene.addPath(qpath, pen_thick)
 
-        # 2. ТОНКАЯ линия (центр фрезы / вектор SVG) - яркая
         pen_thin = QPen(color)
-        pen_thin.setWidthF(0)  # ширина 0 = ровно 1 пиксель всегда (косметически)
+        pen_thin.setWidthF(0)
         pen_thin.setCosmetic(True)
         scene.addPath(qpath, pen_thin)
 
@@ -766,6 +849,7 @@ class MainWindow(QMainWindow):
         h, w = arr.shape[:2]
         return QImage(arr.data, w, h, w * 4, QImage.Format_RGBA8888).copy()
 
+
 def build_stylesheet() -> str:
     return """
 QWidget { background-color: #c0c0c0; color: #000000; font-family: "MS Sans Serif", sans-serif; font-size: 11px; }
@@ -774,23 +858,53 @@ QTabBar::tab { background: #c0c0c0; border: 1px solid #7f7f7f; padding: 4px 10px
 QTabBar::tab:selected { background: #d6d6d6; }
 QGroupBox { border: 1px solid #7f7f7f; margin-top: 10px; padding-top: 10px; font-weight: bold; }
 QGroupBox::title { left: 8px; top: -2px; padding: 0 3px; }
-QLineEdit, QDoubleSpinBox, QComboBox, QListWidget { background-color: #ffffff; border: 1px solid #808080; padding: 2px 4px; }
+QLineEdit, QDoubleSpinBox, QComboBox, QListWidget, QCheckBox { background-color: #ffffff; border: 1px solid #808080; padding: 2px 4px; }
 QPushButton { background-color: #c0c0c0; border-top: 2px solid #ffffff; border-left: 2px solid #ffffff; border-right: 2px solid #404040; border-bottom: 2px solid #404040; min-height: 20px; padding: 2px 10px; }
 QPushButton:pressed { border-top: 2px solid #404040; border-left: 2px solid #404040; border-right: 2px solid #ffffff; border-bottom: 2px solid #ffffff; }
 """
 
+
 def main() -> int:
-    app = QApplication(sys.argv)
+    parser = argparse.ArgumentParser(description="PCB Toolpath Generator")
+    parser.add_argument(
+        "-s", "--skip-validation",
+        action="store_true",
+        help="Игнорировать некритичные ошибки трассировки и коллизии (по умолчанию: выключено)"
+    )
+    parser.add_argument(
+        "-c", "--config",
+        type=str,
+        default=None,
+        help="Путь к YAML-файлу конфигурации для предзагрузки настроек"
+    )
     
-    # Инициализация логирования (консоль + файл app.log)
+    parsed_args, qt_args = parser.parse_known_args()
+    
+    app = QApplication([sys.argv[0]] + qt_args)
+    
     base_dir = Path(__file__).resolve().parent
     setup_logging(base_dir / "app.log")
     
-    if "windows" in {name.lower() for name in QStyleFactory.keys()}: app.setStyle("windows")
+    logger.info(f"Command line parsed. skip_validation={parsed_args.skip_validation}, config={parsed_args.config}")
+    
+    if "windows" in {name.lower() for name in QStyleFactory.keys()}: 
+        app.setStyle("windows")
+        
     app.setStyleSheet(build_stylesheet())
-    window = MainWindow()
+    
+    window = MainWindow(skip_validation=parsed_args.skip_validation)
+    
+    # Если передан аргумент --config, загружаем настройки
+    if parsed_args.config:
+        config_path = Path(parsed_args.config)
+        if config_path.exists():
+            window.load_config_from_yaml(config_path)
+        else:
+            logger.error(f"Config file not found: {parsed_args.config}")
+            
     window.show()
     return app.exec_()
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -33,6 +33,7 @@ class PipelineConfig:
     max_accel_mm_s2: float
     trace_depth_mm: float
     green_depth_mm: float
+    skip_validation: bool = False  # Флаг пропуска блокирующих проверок
 
 @dataclass(frozen=True)
 class HoleCircle:
@@ -123,7 +124,9 @@ def _validate_topology_and_collisions(
     width_px: int,
     height_px: int,
     black_radius_px: float,
-    cut_radius_px: float
+    cut_radius_px: float,
+    skip_validation: bool,
+    warnings_list: list[str]
 ) -> None:
     logger.info("Executing topological consistency checks...")
     errors = []
@@ -167,16 +170,23 @@ def _validate_topology_and_collisions(
             errors.append(f"Коллизия: обнаружено {collisions} пересечений контурной фрезы с дорожками.")
 
     if errors:
-        logger.error(f"Topological consistency checks failed with {len(errors)} issues.")
-        raise PipelineError("Обнаружены критические дефекты трассировки:\n\n" + "\n".join(errors))
-    
-    logger.info("Topological verification passed successfully.")
+        if skip_validation:
+            logger.warning(f"Bypassing {len(errors)} errors due to skip_validation flag.")
+            for err in errors:
+                warnings_list.append(f"[Игнорировано] {err}")
+        else:
+            logger.error(f"Topological consistency checks failed with {len(errors)} issues.")
+            raise PipelineError("Обнаружены критические дефекты трассировки:\n\n" + "\n".join(errors))
+    else:
+        logger.info("Topological verification passed successfully.")
 
 
 # --- Основной конвейер ---
 
 def run_pipeline(config: PipelineConfig) -> PipelineResult:
     logger.info("Pipeline thread started.")
+    warnings_list = []
+    
     _validate_config(config)
     rgba = _load_rgba_image(config.image_path)
     height_px, width_px = rgba.shape[:2]
@@ -187,7 +197,16 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
 
     raw_masks = _classify_color_masks(rgba)
     masks = _segment_color_masks(rgba, raw_masks=raw_masks)
-    _validate_color_overlaps(masks)
+    
+    # Проверка на пересечение цветов
+    try:
+        _validate_color_overlaps(masks)
+    except PipelineError as e:
+        if config.skip_validation:
+            logger.warning(f"Ignored color overlap check: {e}")
+            warnings_list.append(f"[Игнорировано] {e}")
+        else:
+            raise e
 
     drill_radius_px = (config.drill_diameter_mm * px_per_mm) / 2.0
     green_r_mm = _calc_effective_radius_mm(config.green_depth_mm, config.tool_angle_deg)
@@ -224,7 +243,16 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     )
 
     black_geometry = _mask_to_geometry(masks["black"])
-    _validate_drill_collision_mask(holes, black_collision_mask)
+    
+    # Проверка на коллизии сверла с медными дорожками
+    try:
+        _validate_drill_collision_mask(holes, black_collision_mask)
+    except PipelineError as e:
+        if config.skip_validation:
+            logger.warning(f"Ignored drill collision check: {e}")
+            warnings_list.append(f"[Игнорировано] {e}")
+        else:
+            raise e
 
     logger.info(f"Generating green layer (engraving) with mode: '{config.green_mode}'...")
     green_paths = _green_paths(
@@ -253,7 +281,6 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     )
     logger.info(f"Red layer: {len(cut_paths)} vector path segments generated.")
 
-    warnings_list = []
     if not holes:
         warnings_list.append("Слой отверстий (Blue) не обнаружен.")
     if not green_paths:
@@ -274,7 +301,9 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         width_px=width_px,
         height_px=height_px,
         black_radius_px=black_tool_radius_px,
-        cut_radius_px=cut_tool_radius_px
+        cut_radius_px=cut_tool_radius_px,
+        skip_validation=config.skip_validation,
+        warnings_list=warnings_list
     )
     
     logger.info("Pipeline processing completed successfully.")
@@ -372,7 +401,7 @@ def _clean_mask(mask: np.ndarray, min_area: int, do_close: bool, do_open: bool =
 
 def _validate_color_overlaps(masks: dict[str, np.ndarray]) -> None:
     if np.any(masks["red"] & masks["green"]) or np.any(masks["red"] & masks["black"]) or np.any(masks["green"] & masks["black"]):
-        raise PipelineError("Обнаружено пересечение red/green/black. Экспорт заблокирован.")
+        raise PipelineError("Обнаружено пересечение слоев (перекрытия red/green/black).")
 
 def _detect_hole_centers(blue_mask: np.ndarray, drill_radius_px: float) -> list[tuple[float, float]]:
     src = (blue_mask.astype(np.uint8) * 255).astype(np.uint8)
@@ -408,7 +437,7 @@ def _validate_drill_collision_mask(holes: list[HoleCircle], black_mask: np.ndarr
     for idx, hole in enumerate(holes, start=1):
         disk = np.zeros_like(black_u8)
         cv2.circle(disk, (int(round(hole.x_px)), int(round(hole.y_px))), max(1, int(round(hole.radius_px))), 255, thickness=-1)
-        if np.any(cv2.bitwise_and(black_u8, disk)): raise PipelineError(f"Drill touches black track at hole #{idx}.")
+        if np.any(cv2.bitwise_and(black_u8, disk)): raise PipelineError(f"Сверло касается медной дорожки в точке отверстия #{idx}.")
 
 def _green_paths(
     green_mask: np.ndarray, hole_exclusion: np.ndarray, tool_radius_px: float, stepover_px: float, mode: GreenMode, simplify_tolerance_px: float
