@@ -1,5 +1,7 @@
+# pipeline.py
 from __future__ import annotations
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from typing import Literal
 import math
@@ -8,6 +10,8 @@ import numpy as np
 from shapely.geometry import GeometryCollection, LineString, MultiPolygon, Point, Polygon
 from shapely.ops import unary_union
 from skimage.morphology import skeletonize
+
+logger = logging.getLogger("pipeline")
 
 GreenMode = Literal["scanline", "contour-offset", "centerline"]
 
@@ -121,6 +125,7 @@ def _validate_topology_and_collisions(
     black_radius_px: float,
     cut_radius_px: float
 ) -> None:
+    logger.info("Executing topological consistency checks...")
     errors = []
 
     # 1. Валидация дорожек (BLACK)
@@ -162,17 +167,23 @@ def _validate_topology_and_collisions(
             errors.append(f"Коллизия: обнаружено {collisions} пересечений контурной фрезы с дорожками.")
 
     if errors:
+        logger.error(f"Topological consistency checks failed with {len(errors)} issues.")
         raise PipelineError("Обнаружены критические дефекты трассировки:\n\n" + "\n".join(errors))
+    
+    logger.info("Topological verification passed successfully.")
 
 
 # --- Основной конвейер ---
 
 def run_pipeline(config: PipelineConfig) -> PipelineResult:
+    logger.info("Pipeline thread started.")
     _validate_config(config)
     rgba = _load_rgba_image(config.image_path)
     height_px, width_px = rgba.shape[:2]
     width_mm, height_mm = _resolve_mm_size(width_px, height_px, config.width_mm, config.height_mm)
     px_per_mm = width_px / width_mm
+
+    logger.info(f"Loaded image size: {width_px}x{height_px}px ({width_mm:.2f}x{height_mm:.2f}mm) - {px_per_mm:.2f} px/mm")
 
     raw_masks = _classify_color_masks(rgba)
     masks = _segment_color_masks(rgba, raw_masks=raw_masks)
@@ -187,12 +198,21 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     black_tool_radius_px = black_r_mm * px_per_mm
     cut_tool_radius_px = cut_r_mm * px_per_mm
 
+    logger.debug(
+        f"Calculated px radii: drill={drill_radius_px:.2f}, "
+        f"green_tool={green_tool_radius_px:.2f}, "
+        f"black_tool={black_tool_radius_px:.2f}, "
+        f"cut_tool={cut_tool_radius_px:.2f}"
+    )
+
     green_stepover_px = max(1.0, (config.stepover_percent / 100.0) * 2.0 * green_tool_radius_px)
     simplify_tolerance_px = max(0.0, config.simplify_tolerance_mm * px_per_mm)
 
+    logger.info("Detecting drill holes centers...")
     hole_centers = _detect_hole_centers(masks["blue"], drill_radius_px)
     holes = [HoleCircle(x, y, drill_radius_px) for x, y in hole_centers]
     holes = _merge_hole_clusters(holes)
+    logger.info(f"Deduplicated and merged drill holes count: {len(holes)}")
 
     hole_exclusion = _hole_exclusion_mask(masks["green"].shape, holes)
     black_pad_exclusion = _hole_pad_exclusion_mask(raw_masks["black"], holes)
@@ -206,6 +226,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     black_geometry = _mask_to_geometry(masks["black"])
     _validate_drill_collision_mask(holes, black_collision_mask)
 
+    logger.info(f"Generating green layer (engraving) with mode: '{config.green_mode}'...")
     green_paths = _green_paths(
         masks["green"],
         hole_exclusion=hole_exclusion,
@@ -214,18 +235,23 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         mode=config.green_mode,
         simplify_tolerance_px=simplify_tolerance_px,
     )
+    logger.info(f"Green layer: {len(green_paths)} vector path segments generated.")
 
+    logger.info("Generating copper trace isolation paths (black)...")
     black_paths = _black_paths(
         black_geometry,
         holes=holes,
         tool_radius_px=black_tool_radius_px,
         simplify_tolerance_px=simplify_tolerance_px,
     )
+    logger.info(f"Black layer: {len(black_paths)} vector path segments generated.")
 
+    logger.info("Generating board outline paths (red)...")
     cut_paths = _cut_paths(
         masks["red"],
         simplify_tolerance_px=simplify_tolerance_px,
     )
+    logger.info(f"Red layer: {len(cut_paths)} vector path segments generated.")
 
     warnings_list = []
     if not holes:
@@ -237,11 +263,10 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     if not cut_paths:
         warnings_list.append("Слой контура обрезки (Red) не обнаружен.")
     
-    # Единая проверка: ошибка генерируется только если абсолютно все слои пусты
     if not (holes or green_paths or black_paths or cut_paths):
         raise PipelineError("Не найдено ни одного рабочего слоя (отверстия, текст, дорожки или контур).")
 
-    # Топологическая валидация (выполняется только для тех слоев, которые присутствуют на исходном изображении)
+    # Топологическая валидация
     _validate_topology_and_collisions(
         gt_masks=masks,
         black_paths=black_paths,
@@ -252,8 +277,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         cut_radius_px=cut_tool_radius_px
     )
     
-    
-    
+    logger.info("Pipeline processing completed successfully.")
     return PipelineResult(
         width_px=width_px,
         height_px=height_px,
@@ -268,6 +292,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         cut_tool_radius_px=cut_tool_radius_px,
         warnings=warnings_list,
     )
+
 def _validate_config(config: PipelineConfig) -> None:
     if config.green_mode not in {"scanline", "contour-offset", "centerline"}:
         raise PipelineError("Режим green должен быть scanline, contour-offset или centerline.")

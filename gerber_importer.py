@@ -2,9 +2,12 @@
 from __future__ import annotations
 import re
 import math
+import logging
 from pathlib import Path
 import cv2
 import numpy as np
+
+logger = logging.getLogger("gerber_importer")
 
 _last_avg_drill_dia = 0.8
 
@@ -38,6 +41,11 @@ class GerberParser:
             self.leading_zeros = True
         elif '%FST' in content:
             self.leading_zeros = False
+        
+        logger.debug(
+            f"Gerber global settings: units={self.units}, "
+            f"format={self.num_int}.{self.num_dec}, leading_zeros={self.leading_zeros}"
+        )
 
     def parse_coordinate(self, val_str: str) -> float:
         if not val_str:
@@ -68,8 +76,10 @@ class GerberParser:
 
     def parse(self, filepath: Path) -> list:
         if not filepath.exists():
+            logger.warning(f"Gerber file not found: {filepath}")
             return []
         
+        logger.info(f"Parsing Gerber file: {filepath.name}")
         content = filepath.read_text(encoding="utf-8", errors="ignore").replace("\r", "").replace("\n", "")
         self._determine_global_settings(content)
         
@@ -101,6 +111,8 @@ class GerberParser:
                         scale_factor = 25.4 if self.units == "inch" else 1.0
                         dims = [float(x) * scale_factor for x in re.split(r'[xX]', ap_dims)]
                     self.apertures[ap_id] = {"type": ap_type, "dims": dims}
+
+        logger.debug(f"Parsed {len(self.apertures)} apertures definitions")
 
         # 2. Очистка от блоков параметров и парсинг геометрии
         clean_content = re.sub(r'%[^%]+%', '', content)
@@ -150,6 +162,7 @@ class GerberParser:
 
                 self.cx, self.cy = nx, ny
 
+        logger.info(f"Successfully parsed {len(self.paths)} geometric elements from Gerber")
         return self.paths
 
 
@@ -163,8 +176,10 @@ class ExcellonParser:
 
     def parse(self, filepath: Path) -> list[tuple[float, float, float]]:
         if not filepath.exists():
+            logger.warning(f"Excellon file not found: {filepath}")
             return []
 
+        logger.info(f"Parsing Excellon file: {filepath.name}")
         content = filepath.read_text(encoding="utf-8", errors="ignore")
         lines = content.splitlines()
         header_mode = True
@@ -176,8 +191,10 @@ class ExcellonParser:
 
             if 'METRIC' in line:
                 self.scale = 1.0
+                logger.debug("Excellon format detected: METRIC")
             elif 'INCH' in line:
                 self.scale = 25.4
+                logger.debug("Excellon format detected: INCH")
 
             if header_mode:
                 if line.startswith('T') and 'C' in line:
@@ -186,6 +203,7 @@ class ExcellonParser:
                         t_id = int(match.group(1))
                         diameter = float(match.group(2)) * self.scale
                         self.tools[t_id] = diameter
+                        logger.debug(f"Excellon Tool definition: T{t_id} diameter={diameter:.3f} mm")
                 elif line in ('M30', '%') or 'DETECT' in line:
                     header_mode = False
                 continue
@@ -195,6 +213,7 @@ class ExcellonParser:
                 if match:
                     t_id = int(match.group(1))
                     self.current_tool = self.tools.get(t_id, 0.8)
+                    logger.debug(f"Selected Excellon Tool: T{t_id} ({self.current_tool:.3f} mm)")
                 continue
 
             match_drill = re.match(r'(?:X(-?[0-9.]+))?(?:Y(-?[0-9.]+))?', line)
@@ -218,6 +237,7 @@ class ExcellonParser:
                 diameter = self.current_tool if self.current_tool else 0.8
                 self.drills.append((self.cx, self.cy, diameter / 2.0))
 
+        logger.info(f"Successfully parsed {len(self.drills)} drill coordinates from Excellon")
         return self.drills
 
 
@@ -245,6 +265,7 @@ def scale_drills_to_match_copper(
             best_score = score
             best_scale = scale
             
+    logger.info(f"Excellon autoscaling matched best factor: {best_scale} with score: {best_score:.4f}")
     return [(x * best_scale, y * best_scale, r * best_scale) for x, y, r in drills]
 
 
@@ -260,6 +281,7 @@ def render_gerber_and_excellon(
     layers_paths: dict[str, Path], dpi: float = 600.0
 ) -> tuple[np.ndarray, float, float]:
     global _last_avg_drill_dia
+    logger.info("Initializing vector-to-raster assembly pipeline...")
     parsed_data = {'paths': [], 'green': [], 'cut': [], 'holes': []}
     raw_copper_points = []
 
@@ -277,6 +299,7 @@ def render_gerber_and_excellon(
                     raw_copper_points.append(item[1])
 
     if not raw_copper_points:
+        logger.warning("No copper points found. Using dummy boundaries.")
         raw_copper_points = [(0.0, 0.0), (30.0, 25.0)]
 
     c_xs = [pt[0] for pt in raw_copper_points]
@@ -300,6 +323,7 @@ def render_gerber_and_excellon(
     c_ys_clean = [pt[1] for pt in copper_points]
     c_min_x, c_max_x = min(c_xs_clean), max(c_xs_clean)
     c_min_y, c_max_y = min(c_ys_clean), max(c_ys_clean)
+    logger.debug(f"Copper coordinates boundaries: X=[{c_min_x:.3f}, {c_max_x:.3f}], Y=[{c_min_y:.3f}, {c_max_y:.3f}]")
 
     # 2. Чтение и выравнивание Excellon
     if 'holes' in layers_paths:
@@ -308,6 +332,7 @@ def render_gerber_and_excellon(
         parsed_data['holes'] = scale_drills_to_match_copper(raw_drills, c_min_x, c_max_x, c_min_y, c_max_y)
         if parsed_data['holes']:
             _last_avg_drill_dia = sum(r * 2.0 for _, _, r in parsed_data['holes']) / len(parsed_data['holes'])
+            logger.info(f"Average drill diameter determined: {_last_avg_drill_dia:.3f} mm")
 
     # 3. Чтение остальных слоев с жесткой фильтрацией угловых маркеров (лимит < 1.5 мм до меди)
     dist_threshold = 1.5
@@ -344,6 +369,8 @@ def render_gerber_and_excellon(
     scale_px_per_mm = dpi / 25.4
     w_px = int(math.ceil(width_mm * scale_px_per_mm))
     h_px = int(math.ceil(height_mm * scale_px_per_mm))
+    
+    logger.info(f"Rasterizing canvas: {w_px}x{h_px} px ({width_mm:.2f}x{height_mm:.2f} mm) with {dpi} DPI")
 
     canvas = np.full((h_px, w_px, 4), 255, dtype=np.uint8)
 
@@ -413,4 +440,5 @@ def render_gerber_and_excellon(
         r_px = max(1, int(round(r * scale_px_per_mm)))
         cv2.circle(canvas, p, r_px, (0, 80, 255, 255), -1)
 
+    logger.info("Successfully finished Gerber/Excellon rasterization.")
     return canvas, width_mm, height_mm

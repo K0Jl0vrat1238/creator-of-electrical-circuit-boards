@@ -1,8 +1,9 @@
-
+# main.py
 from __future__ import annotations
 import shutil
 import sys
 import math
+import logging
 from pathlib import Path
 import cv2
 import numpy as np
@@ -18,6 +19,35 @@ from PyQt5.QtWidgets import (
 from pipeline import PipelineConfig, PipelineError, PipelineResult, run_pipeline
 from svg_export import export_svg_bundle
 from gerber_importer import render_gerber_and_excellon
+
+# Инициализируем логгер для графического интерфейса
+logger = logging.getLogger("gui")
+
+def setup_logging(log_file_path: Path) -> None:
+    """Настройка глобальной конфигурации логирования (Консоль + Файл)."""
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+    # Вывод в консоль (INFO и выше)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+
+    # Запись в файл (DEBUG и выше)
+    try:
+        file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+        logging.info(f"Logging initialized. Log file: {log_file_path}")
+    except Exception as e:
+        print(f"Failed to create file log handler: {e}", file=sys.stderr)
 
 
 class LayerComposerDialog(QDialog):
@@ -460,6 +490,7 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        logger.info(f"User selected raw image: {path}")
         self._load_image_state(Path(path))
 
     def _show_layer_composer(self) -> None:
@@ -470,8 +501,10 @@ class MainWindow(QMainWindow):
                 self.status_label.setText("Склеиваем слои...")
                 QApplication.processEvents()
                 try:
+                    logger.info(f"Assembling image layers from list: {paths}")
                     self._compose_and_load_layers(paths)
                 except Exception as e:
+                    logger.error("Layer assembly error", exc_info=True)
                     QMessageBox.critical(self, "Ошибка сборки", f"Не удалось склеить слои:\n{e}")
                     self.status_label.setText("Ошибка сборки слоев.")
 
@@ -519,6 +552,7 @@ class MainWindow(QMainWindow):
         else:
             raise ValueError("Ошибка кодирования PNG.")
         
+        logger.info(f"Temporary composed PNG saved to: {out_path}")
         self._load_image_state(out_path)
         self.status_label.setText("Слои успешно собраны.")
 
@@ -532,6 +566,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Импортируем Gerber-файлы...")
             QApplication.processEvents()
             try:
+                logger.info(f"Initiating Gerber import with file paths: {paths}")
                 layers_paths = {k: Path(v) for k, v in paths.items()}
                 composed, width_mm, height_mm = render_gerber_and_excellon(layers_paths)
                 
@@ -547,8 +582,11 @@ class MainWindow(QMainWindow):
                 self.width_radio.setChecked(True)
                 self.width_mm.setValue(width_mm)
                 self._sync_scale_mode()
+                
+                logger.info(f"Gerber vectors rasterized and loaded: size={width_mm:.2f}x{height_mm:.2f} mm")
                 self.status_label.setText(f"Gerber успешно импортирован. Размер: {width_mm:.2f} x {height_mm:.2f} мм")
             except Exception as e:
+                logger.error("Gerber/Excellon import error", exc_info=True)
                 QMessageBox.critical(self, "Ошибка импорта Gerber", f"Не удалось прочитать векторные файлы:\n{e}")
                 self.status_label.setText("Ошибка импорта Gerber.")
     
@@ -592,14 +630,21 @@ class MainWindow(QMainWindow):
 
             config = self._build_config()
             out_dir = self._base_dir / "outputs"
+            
+            logger.info(f"Clearing output directory: {out_dir}")
             self._clear_output_dir(out_dir)
 
+            logger.info("Starting processing pipeline configuration...")
             result = run_pipeline(config)
+            
+            logger.info("Exporting paths into SVG bundles...")
             files = export_svg_bundle(result, out_dir)
+            
             self._last_result = result
             self._update_preview()
 
             self.status_label.setText("SVG сгенерировано.")
+            logger.info(f"SVG bundle generation finalized. Created files count: {len(files)}")
             
             # Формирование отчета
             details = "Созданные файлы:\n" + "\n".join(f"- {path.name}" for path in files.values())
@@ -607,15 +652,18 @@ class MainWindow(QMainWindow):
             # Добавление предупреждений, если они есть
             if result.warnings:
                 warnings_text = "\n\n⚠️ Внимание (некритично):\n" + "\n".join(f"• {w}" for w in result.warnings)
+                logger.warning(f"Pipeline finished with warnings: {result.warnings}")
             else:
                 warnings_text = ""
 
             QMessageBox.information(self, "Успешно завершено", details + warnings_text)
             
         except PipelineError as exc:
+            logger.warning(f"Pipeline domain validation failed: {exc}")
             self.status_label.setText("Ошибка генерации.")
             QMessageBox.critical(self, "Ошибка", str(exc))
         except Exception as exc:
+            logger.error("Critical error during pipeline execution", exc_info=True)
             self.status_label.setText("Ошибка.")
             QMessageBox.critical(self, "Ошибка", f"Непредвиденная ошибка: {exc}")
 
@@ -741,6 +789,11 @@ QPushButton:pressed { border-top: 2px solid #404040; border-left: 2px solid #404
 
 def main() -> int:
     app = QApplication(sys.argv)
+    
+    # Инициализация логирования (консоль + файл app.log)
+    base_dir = Path(__file__).resolve().parent
+    setup_logging(base_dir / "app.log")
+    
     if "windows" in {name.lower() for name in QStyleFactory.keys()}: app.setStyle("windows")
     app.setStyleSheet(build_stylesheet())
     window = MainWindow()
