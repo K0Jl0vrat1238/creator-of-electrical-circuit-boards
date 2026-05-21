@@ -630,21 +630,16 @@ class MainWindow(QMainWindow):
 
             config = self._build_config()
             out_dir = self._base_dir / "outputs"
-            
-            logger.info(f"Clearing output directory: {out_dir}")
             self._clear_output_dir(out_dir)
 
-            logger.info("Starting processing pipeline configuration...")
             result = run_pipeline(config)
             
-            logger.info("Exporting paths into SVG bundles...")
-            files = export_svg_bundle(result, out_dir)
-            
+            # Передаем объект config вторым аргументом для записи YAML-файла
+            files = export_svg_bundle(result, config, out_dir) 
             self._last_result = result
             self._update_preview()
 
             self.status_label.setText("SVG сгенерировано.")
-            logger.info(f"SVG bundle generation finalized. Created files count: {len(files)}")
             
             # Формирование отчета
             details = "Созданные файлы:\n" + "\n".join(f"- {path.name}" for path in files.values())
@@ -652,21 +647,18 @@ class MainWindow(QMainWindow):
             # Добавление предупреждений, если они есть
             if result.warnings:
                 warnings_text = "\n\n⚠️ Внимание (некритично):\n" + "\n".join(f"• {w}" for w in result.warnings)
-                logger.warning(f"Pipeline finished with warnings: {result.warnings}")
             else:
                 warnings_text = ""
 
             QMessageBox.information(self, "Успешно завершено", details + warnings_text)
             
         except PipelineError as exc:
-            logger.warning(f"Pipeline domain validation failed: {exc}")
             self.status_label.setText("Ошибка генерации.")
             QMessageBox.critical(self, "Ошибка", str(exc))
         except Exception as exc:
-            logger.error("Critical error during pipeline execution", exc_info=True)
             self.status_label.setText("Ошибка.")
             QMessageBox.critical(self, "Ошибка", f"Непредвиденная ошибка: {exc}")
-
+            
     def _update_preview(self) -> None:
         scene = self.preview_label.scene()
         scene.clear()  

@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 import xml.etree.ElementTree as ET
-from pipeline import PipelineResult
+import yaml  # Используем библиотеку PyYAML
+from pipeline import PipelineResult, PipelineConfig
 
 logger = logging.getLogger("svg_export")
 
@@ -11,13 +12,61 @@ SVG_NS = "http://www.w3.org/2000/svg"
 ET.register_namespace("", SVG_NS)
 
 
-def export_svg_bundle(result: PipelineResult, output_dir: Path) -> dict[str, Path]:
+def export_yaml_config(config: PipelineConfig, result: PipelineResult, path: Path) -> Path:
+    """Сохраняет конфигурацию запуска в формате YAML с использованием PyYAML."""
+    logger.info(f"Saving YAML configuration using PyYAML to: {path}")
+    
+    # Формируем словарь параметров для сериализации
+    data = {
+        "source_image": config.image_path.resolve().as_posix(),
+        "physical_dimensions": {
+            "width_mm": round(result.width_mm, 4),
+            "height_mm": round(result.height_mm, 4),
+            "resolved_from": "width" if config.width_mm is not None else "height"
+        },
+        "tool_parameters": {
+            "angle_deg": config.tool_angle_deg,
+            "drill_diameter_mm": config.drill_diameter_mm,
+            "stepover_percent": config.stepover_percent,
+            "simplify_tolerance_mm": config.simplify_tolerance_mm,
+            "green_mode": config.green_mode
+        },
+        "gcode_generation": {
+            "stock_thickness_mm": config.stock_thickness_mm,
+            "cut_speed_mm_s": config.cut_speed_mm_s,
+            "max_accel_mm_s2": config.max_accel_mm_s2,
+            "trace_depth_mm": config.trace_depth_mm,
+            "green_depth_mm": config.green_depth_mm
+        }
+    }
+    
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.dump(
+                data, 
+                f, 
+                default_flow_style=False, 
+                sort_keys=False, 
+                allow_unicode=True,
+                indent=2
+            )
+    except Exception as e:
+        logger.error(f"Failed to write YAML config: {e}", exc_info=True)
+        raise e
+
+    return path
+
+
+def export_svg_bundle(result: PipelineResult, config: PipelineConfig, output_dir: Path) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     files = {}
     
-    logger.info(f"Exporting SVG layers to target directory: {output_dir}")
-
-    # Экспортируем файлы только для тех слоев, которые содержат данные
+    logger.info(f"Exporting SVG layers and configuration to target directory: {output_dir}")
+    
+    # 1. Экспорт конфигурационного файла YAML
+    files["config.yaml"] = export_yaml_config(config, result, output_dir / "config.yaml")
+    
+    # 2. Экспортируем файлы только для тех слоев, которые содержат данные
     if result.holes:
         files["holes.svg"] = _write_holes_svg(result, output_dir / "holes.svg")
         logger.debug(f"Holes layer saved: {files['holes.svg'].name}")
@@ -49,7 +98,6 @@ def export_svg_bundle(result: PipelineResult, output_dir: Path) -> dict[str, Pat
         )
         logger.debug(f"Cut layer saved: {files['cut.svg'].name}")
         
-    logger.info(f"SVG Export finalized successfully. Total written layers: {len(files)}")
     return files
 
 
