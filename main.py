@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (
     QGraphicsScene, QGraphicsView, QMainWindow, QMessageBox, QPushButton,
     QRadioButton, QStyleFactory, QTabWidget, QVBoxLayout, QWidget, QCheckBox
 )
-from pipeline import PipelineConfig, PipelineError, PipelineResult, run_pipeline
+from pipeline import PipelineConfig, PipelineError, PipelineResult, run_pipeline, compose_layers_to_image
 from svg_export import export_svg_bundle
 from gerber_importer import render_gerber_and_excellon
 
@@ -514,52 +514,17 @@ class MainWindow(QMainWindow):
                     self.status_label.setText("Ошибка сборки слоев.")
 
     def _compose_and_load_layers(self, paths_dict: dict[str, str]) -> None:
-        images = {}
-        max_w, max_h = 0, 0
-        for layer_name, path in paths_dict.items():
-            raw = np.fromfile(path, dtype=np.uint8)
-            img = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
-            if img is None:
-                continue
-            corners = [int(img[0, 0]), int(img[0, -1]), int(img[-1, 0]), int(img[-1, -1])]
-            if sum(corners) / 4.0 < 128:
-                img = cv2.bitwise_not(img)
-            _, mask = cv2.threshold(img, 150, 255, cv2.THRESH_BINARY_INV)
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            h, w = mask.shape 
-            if w > max_w: max_w = w
-            if h > max_h: max_h = h
-            images[layer_name] = mask
-
-        if not images:
-            raise ValueError("Не удалось прочитать ни один слой.")
-
-        composed = np.full((max_h, max_w, 4), 255, dtype=np.uint8)
-        colors = {
-            'green': [0, 255, 0, 255],
-            'paths': [0, 0, 0, 255],
-            'cut':   [255, 0, 0, 255],
-            'holes': [0, 0, 255, 255]
-        }
-        for layer_name in ['green', 'paths', 'cut', 'holes']:
-            if layer_name in images:
-                mask = images[layer_name]
-                h, w = mask.shape
-                off_y, off_x = (max_h - h) // 2, (max_w - w) // 2
-                roi = composed[off_y:off_y+h, off_x:off_x+w]
-                roi[mask == 255] = np.array(colors[layer_name], dtype=np.uint8)
-
+        resolved_paths = {k: Path(v) for k, v in paths_dict.items() if v}
         out_path = self._base_dir / "composed_source.png"
-        is_success, buffer = cv2.imencode(".png", cv2.cvtColor(composed, cv2.COLOR_RGBA2BGRA))
-        if is_success:
-            buffer.tofile(str(out_path))
-        else:
-            raise ValueError("Ошибка кодирования PNG.")
-        
-        logger.info(f"Temporary composed PNG saved to: {out_path}")
-        self._load_image_state(out_path)
-        self.status_label.setText("Слои успешно собраны.")
+        try:
+            # Используем общую функцию сборки слоев из pipeline.py
+            compose_layers_to_image(resolved_paths, out_path)
+            self._load_image_state(out_path)
+            self.status_label.setText("Слои успешно собраны.")
+        except Exception as e:
+            logger.error("Layer assembly error", exc_info=True)
+            QMessageBox.critical(self, "Ошибка сборки", f"Не удалось склеить слои:\n{e}")
+            self.status_label.setText("Ошибка сборки слоев.")
 
     def _show_gerber_stub(self) -> None:
         dialog = GerberComposerDialog(self)
@@ -609,67 +574,41 @@ class MainWindow(QMainWindow):
         """Считывает настройки из YAML-файла и безопасно заполняет ими GUI."""
         logger.info(f"Loading UI settings from YAML: {path.name}")
         try:
-            content = path.read_text(encoding="utf-8")
-            data = yaml.safe_load(content)
-            if not data:
-                logger.warning("Empty or invalid YAML file.")
-                return
+            config = PipelineConfig.from_yaml(path, skip_validation=self._initial_skip_validation)
             
             # 1. Загрузка исходного изображения
-            img_path_str = data.get("source_image")
-            if img_path_str:
-                img_path = Path(img_path_str)
-                # Если путь относительный, пробуем разрешить его относительно папки с конфигом
-                if not img_path.is_absolute():
-                    resolved = (path.parent / img_path).resolve()
-                    if resolved.exists():
-                        img_path = resolved
-                
-                if img_path.exists():
-                    self._load_image_state(img_path)
-                    logger.info(f"Config loaded image: {img_path}")
-                else:
-                    logger.warning(f"Image path from config does not exist: {img_path_str}")
+            if config.image_path.exists():
+                self._load_image_state(config.image_path)
+                logger.info(f"Config loaded image: {config.image_path}")
+            else:
+                logger.warning(f"Image path from config does not exist: {config.image_path}")
 
             # 2. Физические размеры
-            dims = data.get("physical_dimensions", {})
-            resolved_from = dims.get("resolved_from", "width")
-            if resolved_from == "width" and "width_mm" in dims:
+            if config.width_mm is not None:
                 self.width_radio.setChecked(True)
-                self.width_mm.setValue(float(dims["width_mm"]))
-            elif resolved_from == "height" and "height_mm" in dims:
+                self.width_mm.setValue(config.width_mm)
+            elif config.height_mm is not None:
                 self.height_radio.setChecked(True)
-                self.height_mm.setValue(float(dims["height_mm"]))
+                self.height_mm.setValue(config.height_mm)
             self._sync_scale_mode()
 
             # 3. Параметры инструментов
-            tools = data.get("tool_parameters", {})
-            if "angle_deg" in tools:
-                self.tool_angle_deg.setValue(float(tools["angle_deg"]))
-            if "drill_diameter_mm" in tools:
-                self.drill_diameter_mm.setValue(float(tools["drill_diameter_mm"]))
-            if "stepover_percent" in tools:
-                self.stepover_percent.setValue(float(tools["stepover_percent"]))
-            if "simplify_tolerance_mm" in tools:
-                self.simplify_tolerance_mm.setValue(float(tools["simplify_tolerance_mm"]))
-            if "green_mode" in tools:
-                mode_str = tools["green_mode"]
-                idx = self.green_mode.findData(mode_str)
-                if idx != -1:
-                    self.green_mode.setCurrentIndex(idx)
+            self.tool_angle_deg.setValue(config.tool_angle_deg)
+            self.drill_diameter_mm.setValue(config.drill_diameter_mm)
+            self.stepover_percent.setValue(config.stepover_percent)
+            self.simplify_tolerance_mm.setValue(config.simplify_tolerance_mm)
+            
+            idx = self.green_mode.findData(config.green_mode)
+            if idx != -1:
+                self.green_mode.setCurrentIndex(idx)
 
             # 4. Параметры G-кода
-            gcode = data.get("gcode_generation", {})
-            if "stock_thickness_mm" in gcode:
-                self.stock_thickness_mm.setValue(float(gcode["stock_thickness_mm"]))
-            if "cut_speed_mm_s" in gcode:
-                self.cut_speed_mm_s.setValue(float(gcode["cut_speed_mm_s"]))
-            if "max_accel_mm_s2" in gcode:
-                self.max_accel_mm_s2.setValue(float(gcode["max_accel_mm_s2"]))
-            if "trace_depth_mm" in gcode:
-                self.trace_depth_mm.setValue(float(gcode["trace_depth_mm"]))
-            if "green_depth_mm" in gcode:
-                self.green_depth_mm.setValue(float(gcode["green_depth_mm"]))
+            self.stock_thickness_mm.setValue(config.stock_thickness_mm)
+            self.cut_speed_mm_s.setValue(config.cut_speed_mm_s)
+            self.max_accel_mm_s2.setValue(config.max_accel_mm_s2)
+            self.trace_depth_mm.setValue(config.trace_depth_mm)
+            self.green_depth_mm.setValue(config.green_depth_mm)
+            self.skip_validation_checkbox.setChecked(config.skip_validation)
 
             logger.info("Successfully populated UI fields from YAML.")
             self.status_label.setText(f"Конфиг {path.name} загружен.")
@@ -864,6 +803,49 @@ QPushButton:pressed { border-top: 2px solid #404040; border-left: 2px solid #404
 """
 
 
+def run_headless_workflow(config_path: Path, output_dir: Path | None, skip_validation: bool) -> int:
+    """Выполняет обработку в консольном (безголовом) режиме без инициализации GUI."""
+    try:
+        logger.info("Initializing headless workflow execution...")
+        config = PipelineConfig.from_yaml(config_path, skip_validation=skip_validation)
+        
+        # Определяем директорию для сохранения результатов
+        if output_dir is None:
+            resolved_output_dir = config_path.parent / "outputs"
+        else:
+            resolved_output_dir = Path(output_dir)
+            
+        logger.info(f"Preparing target output directory: {resolved_output_dir}")
+        if resolved_output_dir.exists():
+            shutil.rmtree(resolved_output_dir)
+        resolved_output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Запуск конвейера обработки изображений
+        logger.info("Executing processing pipeline...")
+        result = run_pipeline(config)
+        
+        # Генерация итоговых векторных SVG слоев
+        logger.info("Exporting processed vector tracks to SVG...")
+        files = export_svg_bundle(result, config, resolved_output_dir)
+        
+        logger.info(f"Processing successfully finalized. Created files ({len(files)}):")
+        for key, path in files.items():
+            logger.info(f"  [{key}] -> {path.resolve()}")
+            
+        # =====================================================================
+        # ТОЧКА ИНТЕГРАЦИИ ДЛЯ ПОСЛЕДУЮЩИХ СТАДИЙ
+        # В будущем здесь можно разместить вызовы генерации G-кода, например:
+        #
+        # logger.info("Generating G-code files...")
+        # gcode_files = generate_gcode_bundle(result, config, resolved_output_dir)
+        # =====================================================================
+        
+        return 0
+    except Exception as e:
+        logger.error(f"Execution failed with critical error: {e}", exc_info=True)
+        return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="PCB Toolpath Generator")
     parser.add_argument(
@@ -877,6 +859,17 @@ def main() -> int:
         default=None,
         help="Путь к YAML-файлу конфигурации для предзагрузки настроек"
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Запуск программы в консольном режиме без графического интерфейса"
+    )
+    parser.add_argument(
+        "-o", "--output-dir",
+        type=str,
+        default=None,
+        help="Альтернативный путь для сохранения результатов (только для режима headless)"
+    )
     
     parsed_args, qt_args = parser.parse_known_args()
     
@@ -887,6 +880,18 @@ def main() -> int:
     
     logger.info(f"Command line parsed. skip_validation={parsed_args.skip_validation}, config={parsed_args.config}")
     
+    # 1. Сценарий выполнения в безголовом режиме (headless)
+    if parsed_args.headless:
+        if not parsed_args.config:
+            logger.error("Error: --headless requires a config file. Please specify --config <path_to_yaml>")
+            return 1
+        return run_headless_workflow(
+            config_path=Path(parsed_args.config),
+            output_dir=Path(parsed_args.output_dir) if parsed_args.output_dir else None,
+            skip_validation=parsed_args.skip_validation
+        )
+
+    # 2. Обычный запуск с графическим интерфейсом
     if "windows" in {name.lower() for name in QStyleFactory.keys()}: 
         app.setStyle("windows")
         

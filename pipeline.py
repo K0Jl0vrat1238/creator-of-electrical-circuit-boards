@@ -7,6 +7,7 @@ from typing import Literal
 import math
 import cv2
 import numpy as np
+import yaml
 from shapely.geometry import GeometryCollection, LineString, MultiPolygon, Point, Polygon
 from shapely.ops import unary_union
 from skimage.morphology import skeletonize
@@ -17,6 +18,64 @@ GreenMode = Literal["scanline", "contour-offset", "centerline"]
 
 class PipelineError(ValueError):
     """Domain error for invalid input or impossible toolpaths."""
+
+
+def compose_layers_to_image(layers_paths: dict[str, Path], output_path: Path) -> Path:
+    """
+    Объединяет отдельные растровые слои в одно четырехканальное изображение RGBA
+    и сохраняет его по указанному пути. Используется как в GUI, так и в headless-режиме.
+    """
+    images = {}
+    max_w, max_h = 0, 0
+    for layer_name, path in layers_paths.items():
+        if not path.exists():
+            logger.warning(f"Слой '{layer_name}' не найден по пути: {path}")
+            continue
+            
+        raw = np.fromfile(str(path), dtype=np.uint8)
+        img = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            continue
+        
+        # Автоматическая инверсия, если изображение имеет темный фон
+        corners = [int(img[0, 0]), int(img[0, -1]), int(img[-1, 0]), int(img[-1, -1])]
+        if sum(corners) / 4.0 < 128:
+            img = cv2.bitwise_not(img)
+            
+        _, mask = cv2.threshold(img, 150, 255, cv2.THRESH_BINARY_INV)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        h, w = mask.shape 
+        if w > max_w: max_w = w
+        if h > max_h: max_h = h
+        images[layer_name] = mask
+
+    if not images:
+        raise PipelineError("Не удалось прочитать ни один слой для сборки изображения.")
+
+    composed = np.full((max_h, max_w, 4), 255, dtype=np.uint8)
+    colors = {
+        'green': [0, 255, 0, 255],
+        'paths': [0, 0, 0, 255],
+        'cut':   [255, 0, 0, 255],
+        'holes': [0, 0, 255, 255]
+    }
+    for layer_name in ['green', 'paths', 'cut', 'holes']:
+        if layer_name in images:
+            mask = images[layer_name]
+            h, w = mask.shape
+            off_y, off_x = (max_h - h) // 2, (max_w - w) // 2
+            roi = composed[off_y:off_y+h, off_x:off_x+w]
+            roi[mask == 255] = np.array(colors[layer_name], dtype=np.uint8)
+
+    is_success, buffer = cv2.imencode(".png", cv2.cvtColor(composed, cv2.COLOR_RGBA2BGRA))
+    if is_success:
+        buffer.tofile(str(output_path))
+    else:
+        raise PipelineError("Ошибка кодирования PNG при сборке слоев.")
+        
+    return output_path
+
 
 @dataclass(frozen=True)
 class PipelineConfig:
@@ -34,6 +93,99 @@ class PipelineConfig:
     trace_depth_mm: float
     green_depth_mm: float
     skip_validation: bool = False  # Флаг пропуска блокирующих проверок
+
+    @classmethod
+    def from_yaml(cls, path: Path, skip_validation: bool = False) -> PipelineConfig:
+        """Считывает настройки из файла YAML и конструирует объект PipelineConfig."""
+        if not path.exists():
+            raise FileNotFoundError(f"Файл конфигурации не найден: {path}")
+            
+        content = path.read_text(encoding="utf-8")
+        data = yaml.safe_load(content)
+        if not data:
+            raise ValueError(f"Некорректный или пустой YAML в файле: {path}")
+
+        img_path_str = data.get("source_image")
+        layers_data = data.get("layers")
+        gerber_data = data.get("gerber")
+
+        if not img_path_str and not layers_data and not gerber_data:
+            raise ValueError("Конфигурация YAML должна содержать 'source_image', 'layers' или 'gerber'.")
+
+        dims = data.get("physical_dimensions", {})
+        resolved_from = dims.get("resolved_from", "width")
+        width_mm = None
+        height_mm = None
+        if resolved_from == "width" and "width_mm" in dims:
+            width_mm = float(dims["width_mm"])
+        elif resolved_from == "height" and "height_mm" in dims:
+            height_mm = float(dims["height_mm"])
+
+        # Сценарий 1: Прямой путь к готовому изображению
+        if img_path_str:
+            img_path = Path(img_path_str)
+            if not img_path.is_absolute():
+                img_path = (path.parent / img_path).resolve()
+
+        # Сценарий 2: Описание отдельных растровых слоев в YAML
+        elif layers_data:
+            resolved_layers = {}
+            for layer_name, layer_path_str in layers_data.items():
+                if layer_path_str:
+                    lp = Path(layer_path_str)
+                    if not lp.is_absolute():
+                        lp = (path.parent / lp).resolve()
+                    resolved_layers[layer_name] = lp
+            
+            temp_output_path = path.parent / "composed_source.png"
+            img_path = compose_layers_to_image(resolved_layers, temp_output_path)
+
+        # Сценарий 3: Описание векторных Gerber/Excellon слоев в YAML
+        else:  # gerber_data
+            resolved_gerber = {}
+            for layer_name, layer_path_str in gerber_data.items():
+                if layer_path_str:
+                    lp = Path(layer_path_str)
+                    if not lp.is_absolute():
+                        lp = (path.parent / lp).resolve()
+                    resolved_gerber[layer_name] = lp
+            
+            from gerber_importer import render_gerber_and_excellon
+            composed, g_width_mm, g_height_mm = render_gerber_and_excellon(resolved_gerber)
+            
+            temp_output_path = path.parent / "composed_source.png"
+            is_success, buffer = cv2.imencode(".png", cv2.cvtColor(composed, cv2.COLOR_RGBA2BGRA))
+            if not is_success:
+                raise ValueError("Ошибка сохранения временного растрового изображения из Gerber.")
+            buffer.tofile(str(temp_output_path))
+            img_path = temp_output_path
+            
+            # Если размеры не заданы жестко, берем их напрямую из векторов Gerber
+            if width_mm is None and height_mm is None:
+                width_mm = g_width_mm
+
+        tools = data.get("tool_parameters", {})
+        gcode = data.get("gcode_generation", {})
+        
+        override_validation = skip_validation or gcode.get("skip_validation", False)
+        
+        return cls(
+            image_path=img_path,
+            width_mm=width_mm,
+            height_mm=height_mm,
+            tool_angle_deg=float(tools.get("angle_deg", 30.0)),
+            drill_diameter_mm=float(tools.get("drill_diameter_mm", 0.8)),
+            stepover_percent=float(tools.get("stepover_percent", 50.0)),
+            simplify_tolerance_mm=float(tools.get("simplify_tolerance_mm", 0.0)),
+            green_mode=tools.get("green_mode", "centerline"),
+            stock_thickness_mm=float(gcode.get("stock_thickness_mm", 1.5)),
+            cut_speed_mm_s=float(gcode.get("cut_speed_mm_s", 20.0)),
+            max_accel_mm_s2=float(gcode.get("max_accel_mm_s2", 500.0)),
+            trace_depth_mm=float(gcode.get("trace_depth_mm", 0.2)),
+            green_depth_mm=float(gcode.get("green_depth_mm", 0.1)),
+            skip_validation=override_validation
+        )
+
 
 @dataclass(frozen=True)
 class HoleCircle:
@@ -303,7 +455,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         black_radius_px=black_tool_radius_px,
         cut_radius_px=cut_tool_radius_px,
         skip_validation=config.skip_validation,
-        warnings_list=warnings_list
+        warnings_list=warnings_list,
     )
     
     logger.info("Pipeline processing completed successfully.")
@@ -508,7 +660,7 @@ def _scanline_fill_component(mask: np.ndarray, stepover_px: float) -> list[list[
             start = x
             while x < w and row[x]: x += 1
             if (x - 1) > start: segments.append((float(start), float(x - 1)))
-        if reverse: segments = list(reversed(segments))
+        if reverse: segments = list(reversed(reversed_seg := segments)) # minor ref.
         for idx, (start, end) in enumerate(segments):
             seg_start, seg_end = ((end + 0.5, y + 0.5), (start + 0.5, y + 0.5)) if reverse else ((start + 0.5, y + 0.5), (end + 0.5, y + 0.5))
             if not current_path: current_path.extend([seg_start, seg_end]); continue
