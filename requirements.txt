@@ -3,3 +3,4 @@ opencv-python
 PyQt5
 shapely
 scikit-image
+requests
