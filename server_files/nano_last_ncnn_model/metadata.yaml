@@ -1,0 +1,21 @@
+description: Ultralytics YOLO26n-seg model trained on C:\Users\fedor\Desktop\yolo_train\cnc_data.yaml
+author: Ultralytics
+date: '2026-05-30T01:15:26.010622'
+version: 8.4.51
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: segment
+batch: 1
+imgsz:
+- 640
+- 640
+names:
+  0: workspace
+  1: blank
+  2: danger
+args:
+  batch: 1
+  half: true
+channels: 3
+end2end: false

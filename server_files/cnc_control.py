@@ -13,8 +13,19 @@ class CNCMachine:
         self.is_homed = False
         self.is_busy = False
         self.endstop_triggered = {'X': False, 'Y': False, 'Z': False}
+        self.red_crab_triggered = False
+        self.z_probe_active = False
+        self.active_operation = None
+        self.interrupted_operation = None
         self.pause = False  # Флаг остановки
         self.resume_target = None    # Сюда пишем конечную точку пути
+        
+        # Новые поля для идеального пауза/резьюма пробинга
+        self.remaining_z_probe_points = []
+        self.z_probe_results = []
+        self.first_touch_z = None
+        self.z_probe_v_max = None
+        self.z_probe_a_max = None
         
     def _endstop_callback(self, pin):
         """Фоновый обработчик прерывания от процессора"""
@@ -29,6 +40,18 @@ class CNCMachine:
                         self.endstop_triggered[axis] = True
                 except RuntimeError:
                     pass 
+
+    def _red_crab_callback(self, pin):
+        """Interrupt callback for the PCB touch probe."""
+        if GPIO.getmode() is None:
+            return
+
+        time.sleep(0.002)
+        try:
+            if GPIO.input(pin) == GPIO.HIGH:
+                self.red_crab_triggered = True
+        except RuntimeError:
+            pass
 
     def setup(self):
         """Инициализация портов перед работой или парковкой"""
@@ -48,6 +71,14 @@ class CNCMachine:
             
             GPIO.setup([cfg['step'], cfg['dir'], cfg['en']], GPIO.OUT)
             GPIO.output(cfg['en'], GPIO.LOW) 
+
+        GPIO.setup(RED_CRAB, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        try:
+            GPIO.remove_event_detect(RED_CRAB)
+        except EnvironmentError:
+            pass
+        self.red_crab_triggered = False
+        GPIO.add_event_detect(RED_CRAB, GPIO.FALLING, callback=self._red_crab_callback, bouncetime=20)
         time.sleep(0.1)
     
     def shutdown(self):
@@ -75,6 +106,9 @@ class CNCMachine:
         
         if direction == GPIO.LOW and self.endstop_triggered[axis]:
             return False 
+
+        if self.z_probe_active and axis == 'Z' and direction == GPIO.HIGH and self.red_crab_triggered:
+            return False
         
         if direction == GPIO.HIGH:
             self.endstop_triggered[axis] = False
@@ -91,14 +125,15 @@ class CNCMachine:
         
         return True
 
-    def move_axis_trapezoid(self, axis, steps, direction, v_max=None):
+    def move_axis_trapezoid(self, axis, steps, direction, v_max=None, a_max=None):
         if steps <= 0: 
             return 0
             
         steps = int(steps)
         max_speed = v_max if v_max is not None else V_MAX
+        accel = a_max if a_max is not None else A_MAX
         
-        s_accel = int((max_speed**2 - V_MIN**2) / (2 * A_MAX))
+        s_accel = int((max_speed**2 - V_MIN**2) / (2 * accel))
         if s_accel > steps / 2:
             s_accel = steps // 2
             
@@ -110,10 +145,10 @@ class CNCMachine:
         try:
             for i in range(steps):
                 if i < s_accel:
-                    v_current += A_MAX * (1.0 / v_current)
+                    v_current += accel * (1.0 / v_current)
                     if v_current > max_speed: v_current = max_speed
                 elif i >= s_decel:
-                    v_current -= A_MAX * (1.0 / v_current)
+                    v_current -= accel * (1.0 / v_current)
                     if v_current < V_MIN: v_current = V_MIN
                     
                 if not self.step(axis, direction, 1.0 / v_current):
@@ -264,7 +299,7 @@ class CNCMachine:
             
             return True
         
-    def move_diagonal_trapezoid(self, target_steps_dict, v_max=None):
+    def move_diagonal_trapezoid(self, target_steps_dict, v_max=None, a_max=None):
         """
         Многоосевое движение по алгоритму Брезенхэма с трапециевидным профилем скорости.
         target_steps_dict: словарь вида {'X': 1000, 'Y': 500, 'Z': 0} в абсолютных шагах
@@ -290,7 +325,8 @@ class CNCMachine:
 
         # Настройка профиля скорости по ведущей оси
         max_speed = v_max if v_max is not None else V_MAX
-        s_accel = int((max_speed**2 - V_MIN**2) / (2 * A_MAX))
+        accel = a_max if a_max is not None else A_MAX
+        s_accel = int((max_speed**2 - V_MIN**2) / (2 * accel))
         if s_accel > max_delta / 2:
             s_accel = max_delta // 2
             
@@ -303,10 +339,10 @@ class CNCMachine:
 
             # Разгон и торможение ведущей оси
             if i < s_accel:
-                v_current += A_MAX * (1.0 / v_current)
+                v_current += accel * (1.0 / v_current)
                 if v_current > max_speed: v_current = max_speed
             elif i >= s_decel:
-                v_current -= A_MAX * (1.0 / v_current)
+                v_current -= accel * (1.0 / v_current)
                 if v_current < V_MIN: v_current = V_MIN
 
             # Определяем, какие оси должны сделать шаг в этой итерации
@@ -333,7 +369,7 @@ class CNCMachine:
                 else:
                     self.pos[ax] -= 1
         
-    def move_absolute(self, x=None, y=None, z=None, diagonal=False):
+    def move_absolute(self, x=None, y=None, z=None, diagonal=False, v_max=None, a_max=None):
         if self.pause:
             raise RuntimeError("Выполните Resume")
         
@@ -356,7 +392,7 @@ class CNCMachine:
         if diagonal:
             # Переводим мм в шаги для диагонального алгоритма
             target_steps = {ax: int(targets[ax] * self.spm[ax]) for ax in ['X', 'Y', 'Z']}
-            self.move_diagonal_trapezoid(target_steps)
+            self.move_diagonal_trapezoid(target_steps, v_max=v_max, a_max=a_max)
             
         else:
             for axis in ['Z', 'X', 'Y']:
@@ -365,7 +401,7 @@ class CNCMachine:
                 
                 if diff != 0:
                     direction = GPIO.HIGH if diff > 0 else GPIO.LOW
-                    made_steps = self.move_axis_trapezoid(axis, abs(diff), direction)
+                    made_steps = self.move_axis_trapezoid(axis, abs(diff), direction, v_max=v_max, a_max=a_max)
                     
                     # Запоминаем текущие координаты строго в self.pos по факту сделанных шагов
                     if direction == GPIO.HIGH:
@@ -379,6 +415,9 @@ class CNCMachine:
                             raise RuntimeError("Движение прервано пользователем через Pause!")
                         if self.endstop_triggered[axis]:
                             raise RuntimeError(f"Аварийный останов! Ось {axis} досрочно врезалась в концевик!")
+
+                        if self.z_probe_active and axis == 'Z' and direction == GPIO.HIGH and self.red_crab_triggered:
+                            raise RuntimeError("Emergency stop: RED_CRAB triggered during fast Z move")
 
     def move_relative(self, x=None, y=None, z=None, diagonal=False):
         if self.pause:
@@ -397,3 +436,119 @@ class CNCMachine:
 
     def get_coordinates_mm(self):
         return {ax: self.pos[ax] / self.spm[ax] for ax in ['X', 'Y', 'Z']}
+
+    def _ensure_red_crab_released(self):
+        try:
+            is_triggered = GPIO.input(RED_CRAB) == GPIO.HIGH
+        except RuntimeError as err:
+            raise RuntimeError(f"Cannot read RED_CRAB: {err}")
+
+        if is_triggered:
+            self.red_crab_triggered = True
+            raise RuntimeError("RED_CRAB is still triggered")
+        self.red_crab_triggered = False
+
+    def _probe_z_slow(self):
+        self._ensure_red_crab_released()
+
+        current_z = self.pos['Z'] / self.spm['Z']
+        max_steps = int((MAX_Z - current_z) * self.spm['Z'])
+        if max_steps <= 0:
+            raise RuntimeError("No Z travel left for probing")
+
+        was_probe_active = self.z_probe_active
+        self.z_probe_active = True
+        try:
+            for _ in range(max_steps):
+                if self.pause:
+                    raise RuntimeError("Z probing interrupted by Pause")
+                if self.red_crab_triggered:
+                    return self.pos['Z'] / self.spm['Z']
+
+                if not self.step('Z', GPIO.HIGH, 1.0 / V_MIN):
+                    raise RuntimeError("Z probing step failed")
+                self.pos['Z'] += 1
+
+                if self.red_crab_triggered:
+                    return self.pos['Z'] / self.spm['Z']
+        finally:
+            self.z_probe_active = was_probe_active
+
+        raise RuntimeError("RED_CRAB was not triggered before MAX_Z")
+
+    def z_probe_points(self, points, v_max=None, a_max=None, is_resume=False):
+        if self.pause:
+            raise RuntimeError("Сперва выполните resume")
+        if not self.is_homed:
+            raise RuntimeError("Сперва выполните паркинг")
+
+        if not is_resume and not points:
+            return []
+
+        max_speed = v_max if v_max is not None else V_MAX
+        accel = a_max if a_max is not None else A_MAX
+        if max_speed < V_MIN:
+            raise RuntimeError("V_MAX must be greater than or equal to V_MIN")
+        if accel <= 0:
+            raise RuntimeError("A_MAX must be greater than zero")
+
+        self.active_operation = 'z_probe'
+        self.z_probe_active = True
+
+        # Если это новый запуск, а не продолжение, то инициализируем состояние
+        if not is_resume:
+            self.remaining_z_probe_points = [dict(p) if hasattr(p, 'dict') else p for p in points]
+            self.z_probe_results = []
+            self.first_touch_z = None
+            self.z_probe_v_max = max_speed
+            self.z_probe_a_max = accel
+
+        try:
+            # Крутимся, пока есть незавершенные точки
+            while self.remaining_z_probe_points:
+                if self.pause:
+                    raise RuntimeError("Z probing interrupted by Pause")
+
+                point = self.remaining_z_probe_points[0]
+                x = float(point['x'])
+                y = float(point['y'])
+
+                if not (MIN_X <= x <= MAX_X) or not (MIN_Y <= y <= MAX_Y):
+                    raise RuntimeError(f"Point is outside XY limits: X{x} Y{y}")
+
+                # Безопасно поднимаем Z, переезжаем и замеряем
+                self.move_absolute(z=0.0, v_max=max_speed, a_max=accel)
+                self._ensure_red_crab_released()
+                self.move_absolute(x=x, y=y, z=0.0, v_max=max_speed, a_max=accel)
+
+                if self.first_touch_z is not None:
+                    self._ensure_red_crab_released()
+                    fast_z = max(MIN_Z, self.first_touch_z - 2.0)
+                    if fast_z > 0.0:
+                        self.move_absolute(z=fast_z, v_max=max_speed, a_max=accel)
+
+                touched_z = self._probe_z_slow()
+                if self.first_touch_z is None:
+                    self.first_touch_z = touched_z
+
+                # Записываем результат и удаляем точку из списка только ПОСЛЕ успешного замера
+                self.z_probe_results.append({'x': x, 'y': y, 'z': touched_z})
+                self.remaining_z_probe_points.pop(0)
+
+            # Если всё прошли успешно — поднимаем фрезу и чистим за собой флаги прерывания
+            self.move_absolute(z=0.0, v_max=max_speed, a_max=accel)
+            final_res = list(self.z_probe_results)
+            
+            self.interrupted_operation = None
+            self.remaining_z_probe_points = []
+            self.z_probe_results = []
+            self.first_touch_z = None
+            return final_res
+
+        except Exception:
+            if self.pause:
+                self.interrupted_operation = 'z_probe'
+            raise
+        finally:
+            self.z_probe_active = False
+            self.active_operation = None

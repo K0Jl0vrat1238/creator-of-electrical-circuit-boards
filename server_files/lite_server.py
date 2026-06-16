@@ -25,6 +25,18 @@ class MoveRequest(BaseModel):
     z: Optional[float] = None
     diagonal: bool = False
 
+
+class ZProbePoint(BaseModel):
+    x: float
+    y: float
+    z: Optional[float] = None
+
+
+class ZProbeRequest(BaseModel):
+    points: List[ZProbePoint]
+    V_MAX: Optional[float] = None
+    A_MAX: Optional[float] = None
+
     
 
 # ================= Настройки геометрии стола =================
@@ -498,6 +510,29 @@ def api_move_relative(req: MoveRequest):
     finally:
         cnc.is_busy = False
 
+@app.post("/api/v0/z_probe")
+def api_z_probe(req: ZProbeRequest):
+    if cnc.is_busy:
+        raise HTTPException(status_code=400, detail="Станок занят")
+    if not cnc.is_homed:
+        raise HTTPException(status_code=400, detail="Сперва выполните паркинг")
+
+    cnc.is_busy = True
+    try:
+        points = [point.dict() for point in req.points]
+        result_points = cnc.z_probe_points(points, v_max=req.V_MAX, a_max=req.A_MAX)
+        return {
+            "status": "success",
+            "points": result_points,
+            "current_pos": cnc.get_coordinates_mm()
+        }
+    except RuntimeError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cnc.is_busy = False
+
 @app.get("/api/v0/get_coords")
 def api_get_coords():
     if not cnc.is_homed:
@@ -525,13 +560,25 @@ def api_get_limits():
 def api_stop():
     cnc.pause = True
     cnc.is_homed = False
+    cnc.z_probe_active = False
+    cnc.active_operation = None
+    cnc.interrupted_operation = None
+    cnc.resume_target = None
+    
+    # Полностью сбрасываем кэш пробинга при экстренном стопе
+    if hasattr(cnc, 'remaining_z_probe_points'):
+        cnc.remaining_z_probe_points = []
+    if hasattr(cnc, 'z_probe_results'):
+        cnc.z_probe_results = []
+    if hasattr(cnc, 'first_touch_z'):
+        cnc.first_touch_z = None
     
     cnc.setup()
     cnc.shutdown()
     
     return {
         "status": "stopped",
-        "message": "СТОП! Все обесточено, выполните паркинг.",
+        "message": "СТОП! Все обесточено, пробинг сброшен, выполните паркинг.",
         "current_pos": cnc.get_coordinates_mm() if cnc.is_homed else None
     }
 
@@ -551,6 +598,8 @@ def api_pause():
         }
     # Активируем стоп-флаг, чтобы циклы шагов прервались
     cnc.pause = True
+    if getattr(cnc, 'active_operation', None) == 'z_probe':
+        cnc.resume_target = None
                 
     return {
         "status": "interrupted",
@@ -564,28 +613,40 @@ def api_resume():
         raise HTTPException(status_code=400, detail="Станок сейчас занят другой операцией")
     if not cnc.is_homed:
         raise HTTPException(status_code=400, detail="Сперва запустите паркинг")
-    if not getattr(cnc, 'resume_target', None):
-        raise HTTPException(status_code=400, detail="Нет сохраненной точки для возобновления работы")
         
     cnc.is_busy = True
     try:
-        # Сбрасываем флаг паузы
+        # Снимаем паузу
         cnc.pause = False
         
-        # Доезжаем в ту точку, куда направлялись до нажатия стопа
-        target = cnc.resume_target
-        cnc.move_absolute(
-            x=target['x'], 
-            y=target['y'], 
-            z=target['z'], 
-            diagonal=target.get('diagonal', False) # Достаем флаг, если его нет - по умолчанию False
-        )
-        
-        return {
-            "status": "success", 
-            "message": "Работа успешно возобновлена с места остановки!", 
-            "current_pos": cnc.get_coordinates_mm()
-        }
+        # Проверяем, какая операция была прервана
+        if getattr(cnc, 'interrupted_operation', None) == 'z_probe':
+            v_max = getattr(cnc, 'z_probe_v_max', None)
+            a_max = getattr(cnc, 'z_probe_a_max', None)
+            # Запускаем пробинг в режиме возобновления
+            result_points = cnc.z_probe_points([], v_max=v_max, a_max=a_max, is_resume=True)
+            return {
+                "status": "success",
+                "message": "Z-probing успешно возобновлен и завершен!",
+                "points": result_points,
+                "current_pos": cnc.get_coordinates_mm()
+            }
+        else:
+            # Обычное возобновление перемещения
+            if not getattr(cnc, 'resume_target', None):
+                raise HTTPException(status_code=400, detail="Нет сохраненной точки для возобновления работы")
+            target = cnc.resume_target
+            cnc.move_absolute(
+                x=target['x'], 
+                y=target['y'], 
+                z=target['z'], 
+                diagonal=target.get('diagonal', False)
+            )
+            return {
+                "status": "success", 
+                "message": "Работа успешно возобновлена с места остановки!", 
+                "current_pos": cnc.get_coordinates_mm()
+            }
     except RuntimeError as err:
         raise HTTPException(status_code=400, detail=str(err))
     except Exception as e:
