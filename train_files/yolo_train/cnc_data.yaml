@@ -1,0 +1,8 @@
+# Ссылка на датасет: https://huggingface.co/datasets/CoolFridge/CNC-PCB-Grinder/tree/main
+# Ссылка на предобученные модели: https://huggingface.co/CoolFridge/CNC-PCB-Grinder-YOLO-Seg/tree/main
+path: dataset
+train: images/train
+val: images/val
+
+nc: 3
+names: ['workspace', 'blank', 'danger']
