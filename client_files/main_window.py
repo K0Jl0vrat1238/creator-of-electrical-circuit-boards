@@ -29,7 +29,7 @@ class MainWindow(QMainWindow):
     def __init__(self, skip_validation: bool = False) -> None:
         super().__init__()
         self.setWindowTitle("Фрезеровщик печатных плат")
-        self.setMinimumSize(1140, 860)
+        self.setMinimumSize(1200, 860)
         self._base_dir = Path(__file__).resolve().parent
         self._image_path: Path | None = None
         self._source_qimage: QImage | None = None
@@ -268,14 +268,14 @@ class MainWindow(QMainWindow):
         top_controls.addWidget(QLabel("Модель:"))
         self.combo_model = QComboBox()
         self.combo_model.addItems(["fast", "standart", "Без модели"])
-        self.combo_model.setCurrentText("standart")
+        self.combo_model.setCurrentText("fast")
         top_controls.addWidget(self.combo_model)
 
         self.btn_fetch_photo = QPushButton("Получить фото")
         self.btn_fetch_photo.clicked.connect(self._fetch_placement_photo)
         top_controls.addWidget(self.btn_fetch_photo)
 
-        self.btn_select_pixel = QPushButton("🎯 Выбор пикселя")
+        self.btn_select_pixel = QPushButton("🎯 Ехать в пиксель")
         self.btn_select_pixel.setCheckable(True)
         self.btn_select_pixel.toggled.connect(self._on_select_pixel_toggled)
         top_controls.addWidget(self.btn_select_pixel)
@@ -1097,12 +1097,48 @@ class MainWindow(QMainWindow):
             f"Координаты:\nX: {pos.x():.2f} мм, Y: {pos.y():.2f} мм\nУгол: {angle:.1f}°"
         )
 
+    def _get_blank_safe_path_physical(self, margin: float = 2.0) -> QPainterPath:
+        """Возвращает безопасную зону заготовки (суженную на margin мм от краев)."""
+        blank_path = QPainterPath()
+        for i, det in enumerate(self.placement_detections):
+            if str(det.get("name", "")).lower() == "blank" and i < len(self.placement_segments_mm):
+                poly = QPolygonF([QPointF(pt[0], pt[1]) for pt in self.placement_segments_mm[i]])
+                blank_path.addPolygon(poly)
+                
+        if blank_path.isEmpty(): 
+            return blank_path
+            
+        # Чтобы "сузить" бланк, вычитаем из него его же обводку (stroke)
+        stroker = QPainterPathStroker()
+        stroker.setWidth(margin * 2) # Умножаем на 2, т.к. stroke строится в обе стороны от линии контура
+        outline = stroker.createStroke(blank_path)
+        
+        return blank_path.subtracted(outline)
+
     def _on_run_probing_clicked(self) -> None:
-        """Метод генерации сетки и запуска процесса пробинга."""
+        """Метод генерации умной сетки и запуска процесса пробинга."""
         if not self.placed_pcbs:
             self.show_error("Ошибка", "Сперва нужно разместить плату!")
             return
 
+        # --- ОКНО ПРОВЕРКИ КРОКОДИЛОВ ---
+        msg_box = QMessageBox(self)
+        msg_box.setIcon(QMessageBox.Question)
+        msg_box.setWindowTitle("Важная проверка перед пробингом")
+        msg_box.setText("Вы точно прикрепили крокодилы к шпинделю и плате?")
+        
+        # Создаем свои кнопки с нужным текстом
+        btn_yes = msg_box.addButton("Да, прикрепил, начать пробинг", QMessageBox.AcceptRole)
+        btn_no = msg_box.addButton("Нет, не прикрепил, отменить", QMessageBox.RejectRole)
+        
+        msg_box.exec_()
+        
+        # Если пользователь нажал "Нет" или просто закрыл окно крестиком
+        if msg_box.clickedButton() != btn_yes:
+            logger.info("Пробинг отменен: пользователь не прикрепил крокодилы.")
+            return
+        # --------------------------------
+        
         if not self.is_homed:
             reply = QMessageBox.question(
                 self, "Требуется паркинг",
@@ -1115,14 +1151,33 @@ class MainWindow(QMainWindow):
 
         placed = self.placed_pcbs[-1]
         pcb_hull = self._get_pcb_convex_hull_physical(placed['pos'], placed['angle'])
-        danger_zone = self._get_danger_path_physical()
 
         if pcb_hull.isEmpty():
             self.show_error("Ошибка", "Контур платы пуст, невозможно рассчитать сетку.")
             return
 
-        # Находим границы выпуклой оболочки платы
-        bbox = pcb_hull.boundingRect()
+        # 1. Расширяем зону пробинга на 5мм вокруг платы для лучшей интерполяции краев
+        stroker = QPainterPathStroker()
+        stroker.setWidth(10.0)  # Диаметр 10 = радиус (отступ) 5мм во все стороны
+        stroker.setJoinStyle(Qt.RoundJoin)
+        stroker.setCapStyle(Qt.RoundCap)
+        pcb_expanded = QPainterPath()
+        pcb_expanded.addPath(pcb_hull)
+        pcb_expanded.addPath(stroker.createStroke(pcb_hull))
+
+        # 2. Получаем зоны строгих ограничений
+        blank_safe = self._get_blank_safe_path_physical(margin=2.0) # Запас 2 мм от края бланка
+        danger_zone = self._get_danger_path_physical()              # Запас 3 мм от Danger (заложен внутри метода)
+
+        # ПОЛУЧАЕМ ФИЗИЧЕСКИЕ ЛИМИТЫ СТАНКА ИЗ API
+        limits = self.placement_limits
+        limit_min_x = limits.get("x", {}).get("min", 0.0)
+        limit_max_x = limits.get("x", {}).get("max", 260.0)
+        limit_min_y = limits.get("y", {}).get("min", -160.0)
+        limit_max_y = limits.get("y", {}).get("max", 20.0)
+
+        # Находим границы РАСШИРЕННОЙ оболочки платы
+        bbox = pcb_expanded.boundingRect()
         min_x, max_x = bbox.left(), bbox.right()
         min_y, max_y = bbox.top(), bbox.bottom()
 
@@ -1132,19 +1187,28 @@ class MainWindow(QMainWindow):
         # Создаем сетку
         for x in np.arange(min_x, max_x + grid_step, grid_step):
             for y in np.arange(min_y, max_y + grid_step, grid_step):
+                # ЖЕСТКАЯ ПРОВЕРКА: Точка не должна выходить за пределы станка
+                if not (limit_min_x <= x <= limit_max_x and limit_min_y <= y <= limit_max_y):
+                    continue
+
                 pt = QPointF(x, y)
-                # Точка должна быть строго внутри оболочки платы и вне опасных зон (с запасом 3 мм)
-                if pcb_hull.contains(pt) and not danger_zone.contains(pt):
+                # УСЛОВИЯ ДОБАВЛЕНИЯ ТОЧКИ:
+                # 1. Точка внутри расширенной на 5мм области платы
+                # 2. Точка строго внутри заготовки (с отступом от краев)
+                # 3. Точка строго вне опасных зон (с отступом от краев)
+                if pcb_expanded.contains(pt) and blank_safe.contains(pt) and not danger_zone.contains(pt):
                     points.append({"x": round(float(x), 3), "y": round(float(y), 3)})
 
-        # Если плата слишком маленькая и точки не попали на узлы сетки
+        # Если плата крошечная и сетка пустая, пробуем хотя бы центр
         if not points:
             center = bbox.center()
-            if not danger_zone.contains(center):
-                points.append({"x": round(float(center.x()), 3), "y": round(float(center.y()), 3)})
-
+            cx, cy = center.x(), center.y()
+            if (limit_min_x <= cx <= limit_max_x and limit_min_y <= cy <= limit_max_y):
+                if blank_safe.contains(center) and not danger_zone.contains(center):
+                    points.append({"x": round(float(cx), 3), "y": round(float(cy), 3)})
+                    
         if not points:
-            self.show_error("Внимание", "Не найдено безопасных точек для пробинга!\nВозможно, плата слишком близко к зоне Danger.")
+            self.show_error("Внимание", "Не найдено безопасных точек для пробинга!\nВозможно, плата слишком близко к зоне Danger или вылезает за Blank.")
             return
 
         ip = self.resolve_server_ip()

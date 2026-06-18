@@ -427,7 +427,10 @@ class Spline3DWidget(QWidget):
         ctrl_layout.addWidget(QLabel("Увеличение неровностей (Масштаб Z):"))
         self.z_scale_slider = QSlider(Qt.Horizontal)
         self.z_scale_slider.setRange(1, 100)
-        self.z_scale_slider.setValue(20)  # Дефолтное искажение (х2.0)
+        
+        # Дефолтное искажение почти на минимуме, как на скриншоте
+        self.z_scale_slider.setValue(5)  
+        
         self.z_scale_slider.valueChanged.connect(self._update_z_scale)
         ctrl_layout.addWidget(self.z_scale_slider)
         self.layout.addLayout(ctrl_layout)
@@ -448,9 +451,9 @@ class Spline3DWidget(QWidget):
         ys = np.array([p['y'] for p in points])
         zs = np.array([p['z'] for p in points])
 
-        # Создаем сетку для интерполяции
+        # ОПТИМИЗАЦИЯ ПЕРВАЯ: Уменьшаем плотность сетки со 100х100 до 60х60. 
         margin = 1.0
-        grid_x, grid_y = np.mgrid[min(xs)-margin:max(xs)+margin:100j, min(ys)-margin:max(ys)+margin:100j]
+        grid_x, grid_y = np.mgrid[min(xs)-margin:max(xs)+margin:60j, min(ys)-margin:max(ys)+margin:60j]
 
         try:
             # Пытаемся построить кубическую интерполяцию
@@ -465,8 +468,9 @@ class Spline3DWidget(QWidget):
             nans = np.isnan(grid_z)
             grid_z[nans] = grid_z_nearest[nans]
 
-            # Отрисовка
-            self.ax.plot_surface(grid_x, grid_y, grid_z, cmap='coolwarm', edgecolor='none', alpha=0.85)
+            # Отрисовка: coolwarm_r меняет местами синий и красный
+            # (Малый Z = Красные горы, Большой Z = Синий океан)
+            self.ax.plot_surface(grid_x, grid_y, grid_z, cmap='coolwarm_r', edgecolor='none', alpha=0.85)
             self.ax.scatter(xs, ys, zs, color='black', s=15, label='Точки Z-пробинга', depthshade=False)
 
             self.ax.set_xlabel('X (мм)')
@@ -474,6 +478,15 @@ class Spline3DWidget(QWidget):
             self.ax.set_zlabel('Z (мм)')
             self.ax.set_title("Карта высот платы (Сплайн)")
             self.ax.legend()
+                
+            # ИНВЕРСИЯ ОСИ Z: Так как 0 - это самый верх станка (Home), 
+            # мы инвертируем визуальную ось Z, чтобы бОльшие значения уходили "вниз", как ямы
+            if not self.ax.zaxis_inverted():
+                self.ax.invert_zaxis()
+
+            # Установка дефолтного ракурса камеры как на вашем скриншоте
+            # (Ось X вправо, Ось Y вверх/вглубь)
+            self.ax.view_init(elev=25, azim=-65)
             
             self._update_z_scale()
         except Exception as e:
@@ -486,4 +499,6 @@ class Spline3DWidget(QWidget):
         scale = self.z_scale_slider.value() / 10.0
         # Box aspect: ширина/длина 1:1, а высота масштабируется
         self.ax.set_box_aspect((1, 1, scale))
-        self.canvas.draw()
+        
+        # ОПТИМИЗАЦИЯ ВТОРАЯ: Используем draw_idle()
+        self.canvas.draw_idle()
