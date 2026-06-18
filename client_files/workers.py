@@ -78,7 +78,7 @@ class ApiWorker(QThread):
                 req.data = json.dumps(self.data).encode('utf-8')
                 req.add_header('Content-Type', 'application/json')
                 
-            with urllib.request.urlopen(req, timeout=500) as response:
+            with urllib.request.urlopen(req) as response:
                 raw = response.read().decode('utf-8')
                 res_data = json.loads(raw) if raw else {}
                 logger.info(f"API Success: {self.url}")

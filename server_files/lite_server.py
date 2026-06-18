@@ -49,8 +49,8 @@ TABLE_CROP_BOX = [95, 105, 1035, 1665]
 # =============================================================
 
 cnc = CNCMachine()
-cnc.setup()
 cnc.shutdown()
+
 # --- НЕЙРОСЕТЬ ДЛЯ КАЛИБРОВКИ ---
 class ResBlock(nn.Module):
     def __init__(self, dim):
@@ -573,7 +573,6 @@ def api_stop():
     if hasattr(cnc, 'first_touch_z'):
         cnc.first_touch_z = None
     
-    cnc.setup()
     cnc.shutdown()
     
     return {

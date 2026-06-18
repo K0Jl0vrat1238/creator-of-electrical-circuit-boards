@@ -46,10 +46,22 @@ class CNCMachine:
         if GPIO.getmode() is None:
             return
 
-        time.sleep(0.002)
+        # Сильно уменьшаем первичную паузу до 0.5 миллисекунды (просто чтобы прошел первый пик искры)
+        time.sleep(0.002) 
+        
         try:
-            if GPIO.input(pin) == GPIO.HIGH:
+            high_count = 0
+            num_reads = 5000
+            
+            # Делаем 100 быстрых замеров состояния пина подряд
+            for _ in range(num_reads):
+                if GPIO.input(pin) == GPIO.HIGH:
+                    high_count += 1
+            
+            # Голосование: если состояние HIGH было зафиксировано больше чем в половине случаев
+            if high_count > (num_reads / 2):
                 self.red_crab_triggered = True
+                
         except RuntimeError:
             pass
 
@@ -72,30 +84,47 @@ class CNCMachine:
             GPIO.setup([cfg['step'], cfg['dir'], cfg['en']], GPIO.OUT)
             GPIO.output(cfg['en'], GPIO.LOW) 
 
-        GPIO.setup(RED_CRAB, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        # ИЗМЕНЕНИЕ: Меняем PUD_UP на PUD_DOWN, так как в воздухе у нас LOW
+        GPIO.setup(RED_CRAB, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
         try:
             GPIO.remove_event_detect(RED_CRAB)
         except EnvironmentError:
             pass
         self.red_crab_triggered = False
-        GPIO.add_event_detect(RED_CRAB, GPIO.FALLING, callback=self._red_crab_callback, bouncetime=20)
+        # ИЗМЕНЕНИЕ: Ждем скачка напряжения вверх (RISING) при касании
+        GPIO.add_event_detect(RED_CRAB, GPIO.RISING, callback=self._red_crab_callback, bouncetime=10)
         time.sleep(0.1)
-    
+        
     def shutdown(self):
-        """Обесточивание обмоток моторов"""
-        # Если режим пинов не задан, значит мы даже не стартовали моторы — просто уходим
+        """Обесточивание обмоток моторов без риска Segmentation fault"""
+        # Если режим еще не задан (сервер только включился) - задаем его
         if GPIO.getmode() is None:
-            logger.info("Cервер закрылся сразу после старта.")
-            # return
-         
-        self.setup()
+            GPIO.setmode(GPIO.BOARD)
+            GPIO.setwarnings(False)
             
+        # Настраиваем ТОЛЬКО пины EN на выход и сразу рубим питание моторов
+        for axis in ['X', 'Y', 'Z']:
+            if axis in AXES_CONFIG:
+                en_pin = AXES_CONFIG[axis]['en']
+                try:
+                    GPIO.setup(en_pin, GPIO.OUT)
+                    GPIO.output(en_pin, GPIO.HIGH)
+                except Exception:
+                    pass
+
+        # Безопасно отписываемся от прерываний (если они были запущены)
         for axis in ['X', 'Y', 'Z']:
             if axis in AXES_CONFIG:
                 try:
-                    GPIO.output(AXES_CONFIG[axis]['en'], GPIO.HIGH)
-                except RuntimeError:
+                    GPIO.remove_event_detect(AXES_CONFIG[axis]['endstop'])
+                except Exception:
                     pass
+        try:
+            GPIO.remove_event_detect(RED_CRAB)
+        except Exception:
+            pass
+
+        # Очищаем память
         GPIO.cleanup()
 
     def step(self, axis, direction, delay):
@@ -176,7 +205,7 @@ class CNCMachine:
         # 1. ПРЕДВАРИТЕЛЬНЫЙ ОТСКОК
         if GPIO.input(cfg['endstop']) == GPIO.LOW:
             logger.info(f"[{axis}] Концевик нажат! Освобождаем датчик с разгоном...")
-            self.move_axis_trapezoid(axis, 15 * self.spm[axis], GPIO.HIGH, v_max=V_SLOW_HOME)
+            self.move_axis_trapezoid(axis, 5 * self.spm[axis], GPIO.HIGH, v_max=V_SLOW_HOME)
             time.sleep(0.3)
             if GPIO.input(cfg['endstop']) == GPIO.LOW:
                 raise RuntimeError(f"Авария: Концевик [{axis}] не разблокировался!")
