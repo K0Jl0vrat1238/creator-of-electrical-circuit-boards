@@ -526,12 +526,53 @@ class CNCMachine:
 
         # Если это новый запуск, а не продолжение, то инициализируем состояние
         if not is_resume:
-            self.remaining_z_probe_points = [dict(p) if hasattr(p, 'dict') else p for p in points]
+            raw_points = [dict(p) if hasattr(p, 'dict') else p for p in points]
+            
+            # --- ОПТИМИЗАЦИЯ МАРШРУТА ПРОБИНГА (ЗМЕЙКА) ---
+            if raw_points:
+                # 1. Сортируем все точки сверху вниз. 
+                # Верх стола это Y=-5.0, низ Y=-160.0, поэтому сортируем по убыванию (от бóльшего к меньшему)
+                raw_points.sort(key=lambda p: p['y'], reverse=True)
+                
+                rows = []
+                current_row = []
+                # Допуск 2 мм позволяет объединить в одну строку точки, 
+                # которые стоят не на идеальной математической прямой
+                y_tolerance = 2.0 
+                
+                for p in raw_points:
+                    if not current_row:
+                        current_row.append(p)
+                    else:
+                        if abs(p['y'] - current_row[0]['y']) <= y_tolerance:
+                            current_row.append(p)
+                        else:
+                            rows.append(current_row)
+                            current_row = [p]
+                if current_row:
+                    rows.append(current_row)
+                    
+                # 2. Формируем саму змейку
+                optimized_points = []
+                for i, row in enumerate(rows):
+                    if i % 2 == 0:
+                        # Четные строки (вкл. первую): идем слева-направо (X по возрастанию: от 0 к 260)
+                        row.sort(key=lambda p: p['x'])
+                    else:
+                        # Нечетные строки: идем справа-налево (X по убыванию: от 260 к 0)
+                        row.sort(key=lambda p: p['x'], reverse=True)
+                    optimized_points.extend(row)
+                    
+                self.remaining_z_probe_points = optimized_points
+            else:
+                self.remaining_z_probe_points = []
+            # ----------------------------------------------
+
             self.z_probe_results = []
             self.first_touch_z = None
             self.z_probe_v_max = max_speed
             self.z_probe_a_max = accel
-
+        
         try:
             # Крутимся, пока есть незавершенные точки
             while self.remaining_z_probe_points:
