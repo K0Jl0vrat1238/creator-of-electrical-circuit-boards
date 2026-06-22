@@ -28,10 +28,10 @@ AXES_CONFIG = {
     }
 }
 
-# Запретные зоны (софтверные лимиты в мм)
-# PCB touch probe pin (BOARD mode). Change this to match the RED_CRAB wiring.
+# Крокодил для пробинга
 RED_CRAB = 16
 
+# Запретные зоны (софтверные лимиты в мм)
 MIN_X, MAX_X = 0.0, 260.0
 MIN_Y, MAX_Y = -160.0, 20.0
 MIN_Z, MAX_Z = 0.0, 30.0
