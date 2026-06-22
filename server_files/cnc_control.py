@@ -43,7 +43,7 @@ class CNCMachine:
 
     def _red_crab_callback(self, pin):
         """Interrupt callback for the PCB touch probe."""
-        if GPIO.getmode() is None:
+        if GPIO.getmode() is None or not self.z_probe_active:
             return
 
         # Сильно уменьшаем первичную паузу до 0.5 миллисекунды (просто чтобы прошел первый пик искры)
@@ -86,13 +86,13 @@ class CNCMachine:
 
         # ИЗМЕНЕНИЕ: Меняем PUD_UP на PUD_DOWN, так как в воздухе у нас LOW
         GPIO.setup(RED_CRAB, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+        
+        # Снимаем прерывание (если оно висело), но НЕ вешаем его заново!
         try:
             GPIO.remove_event_detect(RED_CRAB)
         except EnvironmentError:
             pass
         self.red_crab_triggered = False
-        # ИЗМЕНЕНИЕ: Ждем скачка напряжения вверх (RISING) при касании
-        GPIO.add_event_detect(RED_CRAB, GPIO.RISING, callback=self._red_crab_callback, bouncetime=10)
         time.sleep(0.1)
         
     def shutdown(self):
@@ -277,6 +277,13 @@ class CNCMachine:
         """Полный цикл парковки всех осей в безопасном порядке"""
         self.pause = False
         self.resume_target = None
+        self.z_probe_active = False
+        self.remaining_z_probe_points = []
+        self.z_probe_results = []
+        self.first_touch_z = None
+        self.z_probe_v_max = None
+        self.z_probe_a_max = None
+        self.interrupted_operation = None
         self.setup()
         
         good = True
@@ -522,7 +529,14 @@ class CNCMachine:
             raise RuntimeError("A_MAX must be greater than zero")
 
         self.active_operation = 'z_probe'
-        self.z_probe_active = True
+        
+        # --- НАЧАЛО Z-ПРОБИНГА: Включаем прерывание RED_CRAB ---
+        try:
+            GPIO.remove_event_detect(RED_CRAB)
+        except EnvironmentError:
+            pass
+        self.red_crab_triggered = False
+        GPIO.add_event_detect(RED_CRAB, GPIO.RISING, callback=self._red_crab_callback, bouncetime=10)
 
         # Если это новый запуск, а не продолжение, то инициализируем состояние
         if not is_resume:
@@ -530,14 +544,10 @@ class CNCMachine:
             
             # --- ОПТИМИЗАЦИЯ МАРШРУТА ПРОБИНГА (ЗМЕЙКА) ---
             if raw_points:
-                # 1. Сортируем все точки сверху вниз. 
-                # Верх стола это Y=-5.0, низ Y=-160.0, поэтому сортируем по убыванию (от бóльшего к меньшему)
                 raw_points.sort(key=lambda p: p['y'], reverse=True)
                 
                 rows = []
                 current_row = []
-                # Допуск 2 мм позволяет объединить в одну строку точки, 
-                # которые стоят не на идеальной математической прямой
                 y_tolerance = 2.0 
                 
                 for p in raw_points:
@@ -552,14 +562,11 @@ class CNCMachine:
                 if current_row:
                     rows.append(current_row)
                     
-                # 2. Формируем саму змейку
                 optimized_points = []
                 for i, row in enumerate(rows):
                     if i % 2 == 0:
-                        # Четные строки (вкл. первую): идем слева-направо (X по возрастанию: от 0 к 260)
                         row.sort(key=lambda p: p['x'])
                     else:
-                        # Нечетные строки: идем справа-налево (X по убыванию: от 260 к 0)
                         row.sort(key=lambda p: p['x'], reverse=True)
                     optimized_points.extend(row)
                     
@@ -586,18 +593,29 @@ class CNCMachine:
                 if not (MIN_X <= x <= MAX_X) or not (MIN_Y <= y <= MAX_Y):
                     raise RuntimeError(f"Point is outside XY limits: X{x} Y{y}")
 
-                # Безопасно поднимаем Z, переезжаем и замеряем
+                # Поднимаем Z (z_probe_active = False, игнорируем датчик)
                 self.move_absolute(z=0.0, v_max=max_speed, a_max=accel)
                 self._ensure_red_crab_released()
+                
+                # Переезд в XY (z_probe_active = False)
                 self.move_absolute(x=x, y=y, z=0.0, v_max=max_speed, a_max=accel)
 
+                # Быстрый спуск вниз (если уже был первый замер)
                 if self.first_touch_z is not None:
                     self._ensure_red_crab_released()
                     fast_z = max(MIN_Z, self.first_touch_z - 2.0)
                     if fast_z > 0.0:
-                        self.move_absolute(z=fast_z, v_max=max_speed, a_max=accel)
+                        # Включаем флаг активности только для езды ВНИЗ
+                        self.z_probe_active = True
+                        try:
+                            self.move_absolute(z=fast_z, v_max=max_speed, a_max=accel)
+                        finally:
+                            # Обязательно выключаем даже при краше/паузе
+                            self.z_probe_active = False
 
+                # Медленный замер (функция _probe_z_slow сама включает/выключает флаг z_probe_active внутри себя)
                 touched_z = self._probe_z_slow()
+                
                 if self.first_touch_z is None:
                     self.first_touch_z = touched_z
 
@@ -605,7 +623,7 @@ class CNCMachine:
                 self.z_probe_results.append({'x': x, 'y': y, 'z': touched_z})
                 self.remaining_z_probe_points.pop(0)
 
-            # Если всё прошли успешно — поднимаем фрезу и чистим за собой флаги прерывания
+            # Если всё прошли успешно — безопасно поднимаем фрезу (z_probe_active = False)
             self.move_absolute(z=0.0, v_max=max_speed, a_max=accel)
             final_res = list(self.z_probe_results)
             
@@ -620,5 +638,12 @@ class CNCMachine:
                 self.interrupted_operation = 'z_probe'
             raise
         finally:
+            # --- КОНЕЦ Z-ПРОБИНГА: Зачищаем флаги и прерывания при любом исходе ---
             self.z_probe_active = False
             self.active_operation = None
+            
+            try:
+                GPIO.remove_event_detect(RED_CRAB)
+            except EnvironmentError:
+                pass
+            self.red_crab_triggered = False
