@@ -13,11 +13,14 @@ import cv2 as cv
 from fastapi import FastAPI, HTTPException, Query, Response
 import uvicorn
 from ultralytics import YOLO
-from pydantic import BaseModel
+from pydantic import BaseModel, Field 
 from contextlib import asynccontextmanager
 
 from cnc_control import CNCMachine
 from cnc_config import *
+
+class MotorRequest(BaseModel):
+    state: bool = Field(..., description="Состояние мотора: true (вкл) или false (выкл)")
 
 class MoveRequest(BaseModel):
     x: Optional[float] = None
@@ -565,6 +568,10 @@ def api_stop():
     cnc.interrupted_operation = None
     cnc.resume_target = None
     
+    # --- Сбрасываем мотор логически ---
+    cnc.motor_is_on = False
+    cnc.saved_motor_state = False
+    
     # Полностью сбрасываем кэш пробинга при экстренном стопе
     if hasattr(cnc, 'remaining_z_probe_points'):
         cnc.remaining_z_probe_points = []
@@ -600,6 +607,8 @@ def api_pause():
     if getattr(cnc, 'active_operation', None) == 'z_probe':
         cnc.resume_target = None
                 
+    cnc.pause_motor()
+    
     return {
         "status": "interrupted",
         "message": "Пауза! Движение заблокировано.",
@@ -617,6 +626,9 @@ def api_resume():
     try:
         # Снимаем паузу
         cnc.pause = False
+        
+        # --- Возобновляем работу мотора перед началом движения ---
+        cnc.resume_motor()
         
         # Проверяем, какая операция была прервана
         if getattr(cnc, 'interrupted_operation', None) == 'z_probe':
@@ -708,6 +720,22 @@ def api_pixels_to_mm_bulk(req: BulkPixelRequest):
         results.append(mm_pts)
         
     return {"status": "success", "segments_mm": results}
+
+@app.post("/api/v0/set_motor_state")
+def api_set_motor_state(req: MotorRequest):
+    """
+    Включает или выключает вращение шпинделя (true - включен, false - выключен).
+    """
+    try:
+        cnc.set_motor_state(req.state)
+        status_text = "включен" if req.state else "выключен"
+        return {
+            "status": "success", 
+            "message": f"Мотор {status_text}", 
+            "motor_is_on": cnc.motor_is_on
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка управления мотором: {str(e)}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

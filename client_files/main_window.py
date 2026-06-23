@@ -1210,22 +1210,24 @@ class MainWindow(QMainWindow):
         self.trace_depth_mm.valueChanged.connect(lambda: self._validate_depths())
         self.green_depth_mm.valueChanged.connect(lambda: self._validate_depths())
         
-        spindle_layout = QHBoxLayout()
-        self.spindle_slider = QSlider(Qt.Horizontal)
-        self.spindle_slider.setRange(0, 100)
-        self.spindle_slider.setValue(0)
-        self.spindle_label = QLabel("0%")
-        self.spindle_slider.valueChanged.connect(lambda val: self.spindle_label.setText(f"{val}%"))
+        # --- БЛОК УПРАВЛЕНИЯ ШПИНДЕЛЕМ (ВКЛ/ВЫКЛ) ---
+        motor_layout = QHBoxLayout()
+        self.btn_motor_on = QPushButton("🟢 Включить")
+        self.btn_motor_off = QPushButton("🔴 Выключить")
         
-        spindle_layout.addWidget(self.spindle_slider)
-        spindle_layout.addWidget(self.spindle_label)
+        self.btn_motor_on.clicked.connect(lambda: self._set_motor_state(True))
+        self.btn_motor_off.clicked.connect(lambda: self._set_motor_state(False))
+        
+        motor_layout.addWidget(self.btn_motor_on)
+        motor_layout.addWidget(self.btn_motor_off)
+        # ---------------------------------------------
         
         form.addRow("Толщина заготовки:", self.stock_thickness_mm)
         form.addRow("Скорость реза:", self.cut_speed_steps_s)
         form.addRow("Ускорение:", self.max_accel_steps_s2)
         form.addRow("Толщина меди:", self.trace_depth_mm)
         form.addRow("Глубина гравировки:", self.green_depth_mm)
-        form.addRow("Скорость Шпинделя:", spindle_layout)
+        form.addRow("Шпиндель:", motor_layout)
         return group
 
     def _sync_scale_mode(self) -> None:
@@ -1426,3 +1428,23 @@ class MainWindow(QMainWindow):
                         
                 return pt, angle
         return None
+    
+    def _set_motor_state(self, is_on: bool) -> None:
+            """Отправляет команду на включение или выключение мотора"""
+            if not self.is_homed:
+                self.log_human(False, "Ошибка: Невозможно управлять шпинделем, сперва выполните паркинг!")
+                return
+
+            ip = self.resolve_server_ip()
+            if not ip: 
+                return
+
+            # Отправляем запрос на изменение состояния мотора
+            payload = {"state": is_on}
+            worker = ApiWorker(f"http://{ip}:8000/api/v0/set_motor_state", "POST", payload, timeout=3.0)
+            
+            action_name = "Включение мотора" if is_on else "Выключение мотора"
+            
+            worker.success.connect(lambda d: self.log_human(True, f"{action_name} выполнено успешно."))
+            worker.failed.connect(lambda e: self.log_human(False, f"Ошибка сети при попытке изменить состояние мотора: {e}"))
+            self._track_worker(worker)

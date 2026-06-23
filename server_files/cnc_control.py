@@ -27,6 +27,9 @@ class CNCMachine:
         self.z_probe_v_max = None
         self.z_probe_a_max = None
         
+        self.motor_is_on = False      # Текущее состояние (Вкл/Выкл)
+        self.saved_motor_state = False # Сохраненное состояние для Pause/Resume
+        
     def _endstop_callback(self, pin):
         """Фоновый обработчик прерывания от процессора"""
         if GPIO.getmode() is None:
@@ -95,6 +98,13 @@ class CNCMachine:
         self.red_crab_triggered = False
         time.sleep(0.1)
         
+        # Выключаем пин аппаратно
+        try:
+            GPIO.setup(M_MOTOR, GPIO.OUT)
+            GPIO.output(M_MOTOR, GPIO.LOW)
+        except Exception:
+            pass
+        
     def shutdown(self):
         """Обесточивание обмоток моторов без риска Segmentation fault"""
         # Если режим еще не задан (сервер только включился) - задаем его
@@ -121,6 +131,13 @@ class CNCMachine:
                     pass
         try:
             GPIO.remove_event_detect(RED_CRAB)
+        except Exception:
+            pass
+
+        # Выключаем пин аппаратно
+        try:
+            GPIO.setup(M_MOTOR, GPIO.OUT)
+            GPIO.output(M_MOTOR, GPIO.LOW)
         except Exception:
             pass
 
@@ -284,6 +301,8 @@ class CNCMachine:
         self.z_probe_v_max = None
         self.z_probe_a_max = None
         self.interrupted_operation = None
+        self.set_motor_state(False)
+        self.saved_motor_state = False
         self.setup()
         
         good = True
@@ -521,6 +540,10 @@ class CNCMachine:
         if not is_resume and not points:
             return []
 
+        # --- ВЫКЛЮЧАЕМ МОТОР ПЕРЕД ПРОБИНГОМ (ОПАСНО ИСКАТЬ ЗЕМЛЮ ВРАЩАЮЩЕЙСЯ ФРЕЗОЙ) ---
+        self.set_motor_state(False)
+        self.saved_motor_state = False
+        
         max_speed = v_max if v_max is not None else V_MAX
         accel = a_max if a_max is not None else A_MAX
         if max_speed < V_MIN:
@@ -647,3 +670,26 @@ class CNCMachine:
             except EnvironmentError:
                 pass
             self.red_crab_triggered = False
+
+    def set_motor_state(self, is_on: bool):
+        """Включает (True) или выключает (False) мотор"""
+        if GPIO.getmode() is None:
+            return
+        self.motor_is_on = bool(is_on)
+        
+        # Если станок на паузе, мы просто запоминаем состояние, но физически мотор не крутим
+        if self.pause:
+            self.saved_motor_state = self.motor_is_on
+            return
+            
+        GPIO.output(M_MOTOR, GPIO.HIGH if self.motor_is_on else GPIO.LOW)
+
+    def pause_motor(self):
+        """Сохраняет состояние и выключает мотор при паузе"""
+        self.saved_motor_state = self.motor_is_on
+        GPIO.output(M_MOTOR, GPIO.LOW)
+
+    def resume_motor(self):
+        """Восстанавливает работу мотора после снятия с паузы"""
+        self.motor_is_on = self.saved_motor_state
+        GPIO.output(M_MOTOR, GPIO.HIGH if self.motor_is_on else GPIO.LOW)
