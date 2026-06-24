@@ -16,7 +16,6 @@ def export_yaml_config(config: PipelineConfig, result: PipelineResult, path: Pat
     """Сохраняет конфигурацию запуска в формате YAML с использованием PyYAML."""
     logger.info(f"Saving YAML configuration using PyYAML to: {path}")
     
-    # Формируем словарь параметров для сериализации
     data = {
         "source_image": config.image_path.resolve().as_posix(),
         "physical_dimensions": {
@@ -26,7 +25,7 @@ def export_yaml_config(config: PipelineConfig, result: PipelineResult, path: Pat
         },
         "tool_parameters": {
             "angle_deg": config.tool_angle_deg,
-            "drill_diameter_mm": config.drill_diameter_mm,
+            "drill_diameters_mm": config.drill_diameters_mm,
             "stepover_percent": config.stepover_percent,
             "simplify_tolerance_mm": config.simplify_tolerance_mm,
             "green_mode": config.green_mode
@@ -116,6 +115,7 @@ def _svg_root(result: PipelineResult) -> ET.Element:
 def _write_holes_svg(result: PipelineResult, path: Path) -> Path:
     root = _svg_root(result)
     for hole in result.holes:
+        color_hex = f"#{hole.color[0]:02x}{hole.color[1]:02x}{hole.color[2]:02x}"
         ET.SubElement(
             root,
             f"{{{SVG_NS}}}circle",
@@ -123,7 +123,7 @@ def _write_holes_svg(result: PipelineResult, path: Path) -> Path:
                 "cx": f"{hole.x_px:.4f}",
                 "cy": f"{hole.y_px:.4f}",
                 "r": f"{hole.radius_px:.4f}",
-                "fill": "#0050ff",
+                "fill": color_hex,
                 "stroke": "none",
             },
         )

@@ -36,10 +36,8 @@ class MainWindow(QMainWindow):
         self._last_result: PipelineResult | None = None
         self._initial_skip_validation = skip_validation
 
-        # Сохранение активных потоков, чтобы избежать QThread Destroyed
         self._active_workers = []
 
-        # Состояния станка
         self.current_x = None
         self.current_y = None
         self.current_z = None
@@ -68,7 +66,6 @@ class MainWindow(QMainWindow):
 
         self._init_layer_list()
         
-        # Таймер для авто-пинга при вводе IP
         self.ping_timer = QTimer()
         self.ping_timer.setSingleShot(True)
         self.ping_timer.setInterval(3000)
@@ -81,7 +78,6 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(1000, lambda: self._startup_ping)
 
     def _track_worker(self, worker):
-        """Сохраняем ссылку на воркер и удаляем её по завершению работы."""
         self._active_workers.append(worker)
         worker.finished.connect(lambda: self._cleanup_worker(worker))
         worker.start()
@@ -133,7 +129,7 @@ class MainWindow(QMainWindow):
         self._build_spline_tab(self.spline_tab)
 
         from PyQt5.QtWidgets import QTextEdit
-        term_group = QGroupBox("Терминал станка (Логи)")
+        term_group = QGroupBox("Логи:")
         term_layout = QVBoxLayout(term_group)
         term_layout.setContentsMargins(4, 4, 4, 4)
         self.terminal = QTextEdit()
@@ -177,6 +173,28 @@ class MainWindow(QMainWindow):
         btn_play.setFixedSize(35, 35)
         btn_play.clicked.connect(self.resume_command)
         top_panel.addWidget(btn_play)
+
+        # --- НАЧАЛО НОВОГО БЛОКА ПОДКЛЮЧЕНИЯ ---
+        top_panel.addSpacing(15)
+        
+        v_line = QFrame()
+        v_line.setFrameShape(QFrame.VLine)
+        v_line.setFrameShadow(QFrame.Sunken)
+        top_panel.addWidget(v_line)
+        
+        top_panel.addSpacing(10)
+        
+        top_panel.addWidget(QLabel("Сервер:"))
+        self.radio_mac = QRadioButton("MAC")
+        self.radio_ip = QRadioButton("IP")
+        self.radio_mac.setChecked(True)
+        top_panel.addWidget(self.radio_mac)
+        top_panel.addWidget(self.radio_ip)
+        
+        self.server_address_edit = QLineEdit("e4-5f-01-1e-15-f8")
+        self.server_address_edit.setFixedWidth(160)
+        top_panel.addWidget(self.server_address_edit)
+        # --- КОНЕЦ НОВОГО БЛОКА ПОДКЛЮЧЕНИЯ ---
 
         top_panel.addStretch()
         outer.addLayout(top_panel)
@@ -230,19 +248,9 @@ class MainWindow(QMainWindow):
         cols = QHBoxLayout()
 
         col1 = QVBoxLayout()
-        server_group = QGroupBox("Подключение к станку (Сервер)")
-        s_layout = QGridLayout(server_group)
-        self.radio_mac = QRadioButton("MAC Адрес")
-        self.radio_ip = QRadioButton("IP Адрес")
-        self.radio_mac.setChecked(True)
-        s_layout.addWidget(self.radio_mac, 0, 0)
-        s_layout.addWidget(self.radio_ip, 1, 0)
-        self.server_address_edit = QLineEdit("e4-5f-01-1e-15-f8")
-        s_layout.addWidget(self.server_address_edit, 0, 1, 2, 1)
-        col1.addWidget(server_group)
-
         col1.addWidget(self._build_source_group())
         col1.addWidget(self._build_scale_group())
+        col1.addWidget(self._build_drills_group())  # <-- Теперь размеры сверл здесь
         col1.addStretch()
 
         col2 = QVBoxLayout()
@@ -260,6 +268,7 @@ class MainWindow(QMainWindow):
         self.generate_button.clicked.connect(self._generate)
         actions.addWidget(self.generate_button)
         outer.addLayout(actions)
+
 
     def _build_preview_tab(self, parent: QWidget) -> None:
         layout = QHBoxLayout(parent)
@@ -724,7 +733,8 @@ class MainWindow(QMainWindow):
             path.addEllipse(center, r_mm, r_mm)
             item = QGraphicsPathItem(path)
             item.setPen(QPen(Qt.NoPen))
-            item.setBrush(QBrush(QColor(0, 80, 255, 220)))
+            c = QColor(*hole.color, 220)
+            item.setBrush(QBrush(c))
             group.addToGroup(item)
         return group
 
@@ -992,10 +1002,7 @@ class MainWindow(QMainWindow):
         self.auto_worker.start()
 
     def _on_auto_placement_success(self, pos, angle):
-        # СНАЧАЛА добавляем плату в список размещенных
         self.placed_pcbs.append({'pos': pos, 'angle': angle})
-        
-        # ТОЛЬКО ПОТОМ сбрасываем кнопки интерфейса (чтобы проверка bool(self.placed_pcbs) прошла успешно)
         self._reset_auto_placement_btn()
         
         self.placement_tabs.setCurrentWidget(self.proj_tab)
@@ -1164,11 +1171,53 @@ class MainWindow(QMainWindow):
         if suffix: spin.setSuffix(suffix)
         return spin
 
+    def _build_drills_group(self) -> QGroupBox:
+        group = QGroupBox("Диаметры свёрл")
+        layout = QGridLayout(group)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setHorizontalSpacing(15)
+        layout.setVerticalSpacing(4)
+        self.drill_spins = []
+        
+        hole_colors = [
+            ((0, 0, 255), "Синий"),
+            ((0, 255, 255), "Голубой"),
+            ((255, 0, 255), "Пурпурный"),
+            ((255, 255, 0), "Желтый"),
+            ((255, 165, 0), "Оранжевый")
+        ]
+        default_diams = [0.8, 1.0, 1.2, 1.5, 2.0]
+        
+        for idx, (rgb, name) in enumerate(hole_colors):
+            row_layout = QHBoxLayout()
+            
+            swatch = QLabel()
+            swatch.setFixedSize(14, 14)
+            swatch.setStyleSheet(f"background-color: rgb({rgb[0]}, {rgb[1]}, {rgb[2]}); border: 1px solid #000;")
+            row_layout.addWidget(swatch)
+            
+            lbl = QLabel(f"RGB{rgb}")
+            lbl.setFixedWidth(100)
+            row_layout.addWidget(lbl)
+            
+            spin = self._spin(0.0, 1000.0, default_diams[idx], suffix=" мм", decimals=2)
+            self.drill_spins.append(spin)
+            row_layout.addWidget(spin)
+            
+            row_layout.addStretch()
+            
+            # Первые 3 элемента в колонку 0, остальные в колонку 1
+            col = 0 if idx < 3 else 1
+            row = idx if idx < 3 else idx - 3
+            
+            layout.addLayout(row_layout, row, col)
+            
+        return group
+
     def _build_tool_group(self) -> QGroupBox:
         group = QGroupBox("Инструменты и векторные пути")
         form = QFormLayout(group)
         self.tool_angle_deg = self._spin(0.1, 179.0, 30.0, suffix=" °", decimals=1)
-        self.drill_diameter_mm = self._spin(0.01, 1000.0, 0.8, suffix=" мм")
         self.stepover_percent = self._spin(1.0, 100.0, 50.0, suffix=" %", decimals=1)
         self.simplify_tolerance_mm = self._spin(0.0, 100.0, 0.0, suffix=" мм", decimals=4)
         
@@ -1176,20 +1225,16 @@ class MainWindow(QMainWindow):
         self.green_mode.addItems(["По центру линий (Centerline)", "Змейка (scanline)", "Контуры (contour-offset)"])
         
         form.addRow("Угол фрезы:", self.tool_angle_deg)
-        form.addRow("Диаметр сверла:", self.drill_diameter_mm)
         form.addRow("Разряженность:", self.stepover_percent)
         form.addRow("Симплификация:", self.simplify_tolerance_mm)
         form.addRow("Режим гравировки:", self.green_mode)
         return group
 
     def _validate_depths(self) -> None:
-        """Гарантирует, что глубина гравировки всегда меньше толщины меди."""
         copper = self.trace_depth_mm.value()
         green = self.green_depth_mm.value()
-        
         if green >= copper:
             self.green_depth_mm.blockSignals(True)
-            # Устанавливаем глубину гравировки чуть меньше меди (например, на 0.01 мм меньше, или минимум 0.001)
             new_green = max(0.001, copper - 0.01)
             self.green_depth_mm.setValue(new_green)
             self.green_depth_mm.blockSignals(False)
@@ -1206,21 +1251,16 @@ class MainWindow(QMainWindow):
         self.trace_depth_mm = self._spin(0.001, 1000.0, 0.2, suffix=" мм")
         self.green_depth_mm = self._spin(0.001, 1000.0, 0.1, suffix=" мм")
         
-        # Подключаем валидацию
         self.trace_depth_mm.valueChanged.connect(lambda: self._validate_depths())
         self.green_depth_mm.valueChanged.connect(lambda: self._validate_depths())
         
-        # --- БЛОК УПРАВЛЕНИЯ ШПИНДЕЛЕМ (ВКЛ/ВЫКЛ) ---
         motor_layout = QHBoxLayout()
         self.btn_motor_on = QPushButton("🟢 Включить")
         self.btn_motor_off = QPushButton("🔴 Выключить")
-        
         self.btn_motor_on.clicked.connect(lambda: self._set_motor_state(True))
         self.btn_motor_off.clicked.connect(lambda: self._set_motor_state(False))
-        
         motor_layout.addWidget(self.btn_motor_on)
         motor_layout.addWidget(self.btn_motor_off)
-        # ---------------------------------------------
         
         form.addRow("Толщина заготовки:", self.stock_thickness_mm)
         form.addRow("Скорость реза:", self.cut_speed_steps_s)
@@ -1253,7 +1293,15 @@ class MainWindow(QMainWindow):
         dialog = GerberComposerDialog(self)
         if dialog.exec_() and (paths := dialog.get_paths()):
             layers_paths = {k: Path(v) for k, v in paths.items()}
-            composed, w_mm, h_mm = render_gerber_and_excellon(layers_paths)
+            
+            # Теперь функция возвращает 4 значения, включая массив диаметров сверл
+            composed, w_mm, h_mm, drill_diams = render_gerber_and_excellon(layers_paths)
+            
+            # Обновляем значения в спинбоксах интерфейса
+            for i, spin in enumerate(self.drill_spins):
+                if i < len(drill_diams):
+                    spin.setValue(drill_diams[i])
+            
             out_path = self._base_dir / "composed_source.png"
             is_success, buffer = cv2.imencode(".png", cv2.cvtColor(composed, cv2.COLOR_RGBA2BGRA))
             if is_success: buffer.tofile(str(out_path))
@@ -1288,6 +1336,10 @@ class MainWindow(QMainWindow):
                 self.height_radio.setChecked(True)
                 self.height_mm.setValue(config.height_mm)
             self._sync_scale_mode()
+            
+            for i, val in enumerate(config.drill_diameters_mm):
+                if i < len(self.drill_spins):
+                    self.drill_spins[i].setValue(val)
         except Exception: pass
 
     def _build_config(self) -> PipelineConfig:
@@ -1295,9 +1347,13 @@ class MainWindow(QMainWindow):
         w = float(self.width_mm.value()) if self.width_radio.isChecked() else None
         h = float(self.height_mm.value()) if not self.width_radio.isChecked() else None
         mode = "centerline" if "Centerline" in self.green_mode.currentText() else ("scanline" if "scanline" in self.green_mode.currentText() else "contour-offset")
+        
+        diams = [float(spin.value()) for spin in self.drill_spins]
+        
         return PipelineConfig(
             image_path=self._image_path, width_mm=w, height_mm=h,
-            tool_angle_deg=float(self.tool_angle_deg.value()), drill_diameter_mm=float(self.drill_diameter_mm.value()),
+            tool_angle_deg=float(self.tool_angle_deg.value()), 
+            drill_diameters_mm=diams,
             stepover_percent=float(self.stepover_percent.value()), simplify_tolerance_mm=float(self.simplify_tolerance_mm.value()),
             green_mode=mode, stock_thickness_mm=float(self.stock_thickness_mm.value()),
             cut_speed_mm_s=float(self.cut_speed_steps_s.value()), max_accel_mm_s2=float(self.max_accel_steps_s2.value()),
@@ -1339,7 +1395,8 @@ class MainWindow(QMainWindow):
             
             if layer_key == "holes":
                 for hole in self._last_result.holes:
-                    scene.addEllipse(hole.x_px - hole.radius_px, hole.y_px - hole.radius_px, hole.radius_px * 2, hole.radius_px * 2, QPen(Qt.NoPen), QColor(0, 80, 255, 220))
+                    c = QColor(*hole.color, 220)
+                    scene.addEllipse(hole.x_px - hole.radius_px, hole.y_px - hole.radius_px, hole.radius_px * 2, hole.radius_px * 2, QPen(Qt.NoPen), c)
             elif layer_key == "green":
                 self._add_paths_to_scene(scene, self._last_result.green_paths, QColor(0, 200, 0, 255), self._last_result.green_tool_radius_px * 2)
             elif layer_key == "paths":
@@ -1365,7 +1422,6 @@ class MainWindow(QMainWindow):
         scene.addPath(qpath, pen_thin)
         
     def find_auto_placement_sync(self) -> tuple[QPointF, float] | None:
-        """Синхронное авторазмещение (БЕЗ фоновых потоков и сигналов GUI) для Headless-режима"""
         blank_path = QPainterPath()
         danger_path = QPainterPath()
         
@@ -1430,7 +1486,6 @@ class MainWindow(QMainWindow):
         return None
     
     def _set_motor_state(self, is_on: bool) -> None:
-            """Отправляет команду на включение или выключение мотора"""
             if not self.is_homed:
                 self.log_human(False, "Ошибка: Невозможно управлять шпинделем, сперва выполните паркинг!")
                 return
@@ -1439,7 +1494,6 @@ class MainWindow(QMainWindow):
             if not ip: 
                 return
 
-            # Отправляем запрос на изменение состояния мотора
             payload = {"state": is_on}
             worker = ApiWorker(f"http://{ip}:8000/api/v0/set_motor_state", "POST", payload, timeout=3.0)
             

@@ -4,16 +4,11 @@ import re
 import math
 import logging
 from pathlib import Path
+from collections import Counter
 import cv2
 import numpy as np
 
 logger = logging.getLogger("gerber_importer")
-
-_last_avg_drill_dia = 0.8
-
-def get_last_avg_drill_diameter() -> float:
-    return _last_avg_drill_dia
-
 
 class GerberParser:
     def __init__(self):
@@ -83,7 +78,6 @@ class GerberParser:
         content = filepath.read_text(encoding="utf-8", errors="ignore").replace("\r", "").replace("\n", "")
         self._determine_global_settings(content)
         
-        # 1. Извлечение и парсинг параметров %...% до разбиения по звездочкам
         params = re.findall(r'%([^%]+)%', content)
         for param in params:
             param = param.strip()
@@ -112,9 +106,6 @@ class GerberParser:
                         dims = [float(x) * scale_factor for x in re.split(r'[xX]', ap_dims)]
                     self.apertures[ap_id] = {"type": ap_type, "dims": dims}
 
-        logger.debug(f"Parsed {len(self.apertures)} apertures definitions")
-
-        # 2. Очистка от блоков параметров и парсинг геометрии
         clean_content = re.sub(r'%[^%]+%', '', content)
         blocks = clean_content.split('*')
         
@@ -162,7 +153,6 @@ class GerberParser:
 
                 self.cx, self.cy = nx, ny
 
-        logger.info(f"Successfully parsed {len(self.paths)} geometric elements from Gerber")
         return self.paths
 
 
@@ -176,13 +166,10 @@ class ExcellonParser:
 
     def parse(self, filepath: Path) -> list[tuple[float, float, float]]:
         if not filepath.exists():
-            logger.warning(f"Excellon file not found: {filepath}")
             return []
 
-        logger.info(f"Parsing Excellon file: {filepath.name}")
         content = filepath.read_text(encoding="utf-8", errors="ignore")
         lines = content.splitlines()
-        header_mode = True
 
         for line in lines:
             line = line.strip().upper()
@@ -191,31 +178,28 @@ class ExcellonParser:
 
             if 'METRIC' in line:
                 self.scale = 1.0
-                logger.debug("Excellon format detected: METRIC")
             elif 'INCH' in line:
                 self.scale = 25.4
-                logger.debug("Excellon format detected: INCH")
 
-            if header_mode:
-                if line.startswith('T') and 'C' in line:
-                    match = re.match(r'T(\d+)C([0-9.]+)', line)
-                    if match:
-                        t_id = int(match.group(1))
-                        diameter = float(match.group(2)) * self.scale
-                        self.tools[t_id] = diameter
-                        logger.debug(f"Excellon Tool definition: T{t_id} diameter={diameter:.3f} mm")
-                elif line in ('M30', '%') or 'DETECT' in line:
-                    header_mode = False
+            # Универсальный поиск объявлений инструментов (без привязки к шапке)
+            if line.startswith('T') and 'C' in line:
+                match = re.match(r'T(\d+)C([0-9.]+)', line)
+                if match:
+                    t_id = int(match.group(1))
+                    diameter = float(match.group(2)) * self.scale
+                    self.tools[t_id] = diameter
                 continue
 
+            # Выбор текущего инструмента
             if line.startswith('T') and 'C' not in line:
                 match = re.match(r'T(\d+)', line)
                 if match:
                     t_id = int(match.group(1))
+                    # Если инструмент не найден, ставим дефолт 0.8
                     self.current_tool = self.tools.get(t_id, 0.8)
-                    logger.debug(f"Selected Excellon Tool: T{t_id} ({self.current_tool:.3f} mm)")
                 continue
 
+            # Чтение координат
             match_drill = re.match(r'(?:X(-?[0-9.]+))?(?:Y(-?[0-9.]+))?', line)
             if match_drill and (match_drill.group(1) or match_drill.group(2)):
                 raw_x = match_drill.group(1)
@@ -237,7 +221,6 @@ class ExcellonParser:
                 diameter = self.current_tool if self.current_tool else 0.8
                 self.drills.append((self.cx, self.cy, diameter / 2.0))
 
-        logger.info(f"Successfully parsed {len(self.drills)} drill coordinates from Excellon")
         return self.drills
 
 
@@ -255,17 +238,12 @@ def scale_drills_to_match_copper(
     for scale in test_factors:
         xs = [d[0] * scale for d in drills]
         ys = [d[1] * scale for d in drills]
-        d_min_x, d_max_x = min(xs), max(xs)
-        d_min_y, d_max_y = min(ys), max(ys)
-        
-        score = (abs(d_min_x - c_min_x) + abs(d_max_x - c_max_x) + 
-                 abs(d_min_y - c_min_y) + abs(d_max_y - c_max_y))
-        
+        score = (abs(min(xs) - c_min_x) + abs(max(xs) - c_max_x) + 
+                 abs(min(ys) - c_min_y) + abs(max(ys) - c_max_y))
         if score < best_score:
             best_score = score
             best_scale = scale
             
-    logger.info(f"Excellon autoscaling matched best factor: {best_scale} with score: {best_score:.4f}")
     return [(x * best_scale, y * best_scale, r * best_scale) for x, y, r in drills]
 
 
@@ -279,13 +257,11 @@ def distance_to_copper(x: float, y: float, copper_points: list[tuple[float, floa
 
 def render_gerber_and_excellon(
     layers_paths: dict[str, Path], dpi: float = 600.0
-) -> tuple[np.ndarray, float, float]:
-    global _last_avg_drill_dia
+) -> tuple[np.ndarray, float, float, list[float]]:
     logger.info("Initializing vector-to-raster assembly pipeline...")
     parsed_data = {'paths': [], 'green': [], 'cut': [], 'holes': []}
     raw_copper_points = []
 
-    # 1. Чтение медного слоя
     if 'paths' in layers_paths:
         p = GerberParser()
         parsed_data['paths'] = p.parse(layers_paths['paths'])
@@ -299,47 +275,44 @@ def render_gerber_and_excellon(
                     raw_copper_points.append(item[1])
 
     if not raw_copper_points:
-        logger.warning("No copper points found. Using dummy boundaries.")
         raw_copper_points = [(0.0, 0.0), (30.0, 25.0)]
 
     c_xs = [pt[0] for pt in raw_copper_points]
     c_ys = [pt[1] for pt in raw_copper_points]
+    med_x, med_y = np.median(c_xs), np.median(c_ys)
     
-    med_x = np.median(c_xs)
-    med_y = np.median(c_ys)
-    
-    # Зона платы лежит строго в пределах 18.0 мм от медианы плотности
     limit_min_x, limit_max_x = med_x - 18.0, med_x + 18.0
     limit_min_y, limit_max_y = med_y - 18.0, med_y + 18.0
 
-    copper_points = [
-        pt for pt in raw_copper_points 
-        if limit_min_x <= pt[0] <= limit_max_x and limit_min_y <= pt[1] <= limit_max_y
-    ]
-    if not copper_points:
-        copper_points = raw_copper_points
+    copper_points = [pt for pt in raw_copper_points if limit_min_x <= pt[0] <= limit_max_x and limit_min_y <= pt[1] <= limit_max_y]
+    if not copper_points: copper_points = raw_copper_points
 
     c_xs_clean = [pt[0] for pt in copper_points]
     c_ys_clean = [pt[1] for pt in copper_points]
     c_min_x, c_max_x = min(c_xs_clean), max(c_xs_clean)
     c_min_y, c_max_y = min(c_ys_clean), max(c_ys_clean)
-    logger.debug(f"Copper coordinates boundaries: X=[{c_min_x:.3f}, {c_max_x:.3f}], Y=[{c_min_y:.3f}, {c_max_y:.3f}]")
 
-    # 2. Чтение и выравнивание Excellon
+    # Кластеризация диаметров отверстий (топ-5)
+    ui_diams = [0.0] * 5
+    top_5_diams = []
+
     if 'holes' in layers_paths:
         p = ExcellonParser()
         raw_drills = p.parse(layers_paths['holes'])
         parsed_data['holes'] = scale_drills_to_match_copper(raw_drills, c_min_x, c_max_x, c_min_y, c_max_y)
+        
         if parsed_data['holes']:
-            _last_avg_drill_dia = sum(r * 2.0 for _, _, r in parsed_data['holes']) / len(parsed_data['holes'])
-            logger.info(f"Average drill diameter determined: {_last_avg_drill_dia:.3f} mm")
+            all_diams = [round(r * 2.0, 3) for _, _, r in parsed_data['holes']]
+            counts = Counter(all_diams)
+            most_common = counts.most_common(5)
+            top_5_diams = sorted([d for d, _ in most_common])
+            for i, d in enumerate(top_5_diams):
+                ui_diams[i] = d
 
-    # 3. Чтение остальных слоев с жесткой фильтрацией угловых маркеров (лимит < 1.5 мм до меди)
     dist_threshold = 1.5
 
     if 'green' in layers_paths:
-        raw_green = GerberParser().parse(layers_paths['green'])
-        for item in raw_green:
+        for item in GerberParser().parse(layers_paths['green']):
             if item[0] == 'line':
                 x1, y1, x2, y2 = item[1]
                 if distance_to_copper(x1, y1, copper_points) < dist_threshold or distance_to_copper(x2, y2, copper_points) < dist_threshold:
@@ -349,19 +322,15 @@ def render_gerber_and_excellon(
                     parsed_data['green'].append(item)
 
     if 'cut' in layers_paths:
-        raw_cut = GerberParser().parse(layers_paths['cut'])
-        for item in raw_cut:
+        for item in GerberParser().parse(layers_paths['cut']):
             if item[0] == 'line':
                 x1, y1, x2, y2 = item[1]
                 if distance_to_copper(x1, y1, copper_points) < dist_threshold or distance_to_copper(x2, y2, copper_points) < dist_threshold:
                     parsed_data['cut'].append(item)
 
-    # Настройка холста
     margin = 1.0
-    min_x = c_min_x - margin
-    max_x = c_max_x + margin
-    min_y = c_min_y - margin
-    max_y = c_max_y + margin
+    min_x, max_x = c_min_x - margin, c_max_x + margin
+    min_y, max_y = c_min_y - margin, c_max_y + margin
 
     width_mm = max_x - min_x
     height_mm = max_y - min_y
@@ -370,75 +339,61 @@ def render_gerber_and_excellon(
     w_px = int(math.ceil(width_mm * scale_px_per_mm))
     h_px = int(math.ceil(height_mm * scale_px_per_mm))
     
-    logger.info(f"Rasterizing canvas: {w_px}x{h_px} px ({width_mm:.2f}x{height_mm:.2f} mm) with {dpi} DPI")
-
     canvas = np.full((h_px, w_px, 4), 255, dtype=np.uint8)
 
     def to_px(x: float, y: float) -> tuple[int, int]:
-        px = int(round((x - min_x) * scale_px_per_mm))
-        py = int(round((max_y - y) * scale_px_per_mm))
-        return px, py
+        return int(round((x - min_x) * scale_px_per_mm)), int(round((max_y - y) * scale_px_per_mm))
 
-    # --- Отрисовка ---
-
-    # 1. Текст (Green)
     for item in parsed_data['green']:
         if item[0] == 'line':
-            p1, p2 = to_px(item[1][0], item[1][1]), to_px(item[1][2], item[1][3])
-            w = max(1, int(round(item[2] * scale_px_per_mm)))
-            cv2.line(canvas, p1, p2, (0, 200, 0, 255), w)
+            cv2.line(canvas, to_px(item[1][0], item[1][1]), to_px(item[1][2], item[1][3]), (0, 200, 0, 255), max(1, int(round(item[2] * scale_px_per_mm))))
         elif item[0] == 'flash':
-            p = to_px(item[1][0], item[1][1])
-            r = max(1, int(round((item[2] / 2.0) * scale_px_per_mm)))
-            cv2.circle(canvas, p, r, (0, 200, 0, 255), -1)
+            cv2.circle(canvas, to_px(item[1][0], item[1][1]), max(1, int(round((item[2] / 2.0) * scale_px_per_mm))), (0, 200, 0, 255), -1)
         elif item[0] == 'polygon':
-            pts = np.array([to_px(pt[0], pt[1]) for pt in item[1]], np.int32).reshape((-1, 1, 2))
-            cv2.fillPoly(canvas, [pts], (0, 200, 0, 255))
+            cv2.fillPoly(canvas, [np.array([to_px(pt[0], pt[1]) for pt in item[1]], np.int32).reshape((-1, 1, 2))], (0, 200, 0, 255))
 
-    # 2. Дорожки и контактные площадки (Black)
     for item in parsed_data['paths']:
         if item[0] == 'line':
             x1, y1, x2, y2 = item[1]
-            if distance_to_copper(x1, y1, copper_points) > dist_threshold:
-                continue
-            p1, p2 = to_px(x1, y1), to_px(x2, y2)
-            w = max(1, int(round(item[2] * scale_px_per_mm)))
-            cv2.line(canvas, p1, p2, (20, 20, 20, 255), w)
+            if distance_to_copper(x1, y1, copper_points) <= dist_threshold:
+                cv2.line(canvas, to_px(x1, y1), to_px(x2, y2), (20, 20, 20, 255), max(1, int(round(item[2] * scale_px_per_mm))))
         elif item[0] == 'flash':
-            # item: ('flash', (x, y), ap_type, ap_dims)
             (fx, fy), ap_type, ap_dims = item[1], item[2], item[3]
-            if distance_to_copper(fx, fy, copper_points) > dist_threshold:
-                continue
-            p = to_px(fx, fy)
-            if ap_type == 'C':  
-                r = max(1, int(round((ap_dims[0] / 2.0) * scale_px_per_mm)))
-                cv2.circle(canvas, p, r, (20, 20, 20, 255), -1)
-            elif ap_type in ('R', 'O'):  
-                w_mm = ap_dims[0]
-                h_mm = ap_dims[1] if len(ap_dims) > 1 else ap_dims[0]
-                w_px = max(1, int(round(w_mm * scale_px_per_mm)))
-                h_px = max(1, int(round(h_mm * scale_px_per_mm)))
-                p1 = (p[0] - w_px // 2, p[1] - h_px // 2)
-                p2 = (p[0] + w_px // 2, p[1] + h_px // 2)
-                cv2.rectangle(canvas, p1, p2, (20, 20, 20, 255), -1)
+            if distance_to_copper(fx, fy, copper_points) <= dist_threshold:
+                p = to_px(fx, fy)
+                if ap_type == 'C':  
+                    cv2.circle(canvas, p, max(1, int(round((ap_dims[0] / 2.0) * scale_px_per_mm))), (20, 20, 20, 255), -1)
+                elif ap_type in ('R', 'O'):  
+                    w_px_rect = max(1, int(round(ap_dims[0] * scale_px_per_mm)))
+                    h_px_rect = max(1, int(round((ap_dims[1] if len(ap_dims) > 1 else ap_dims[0]) * scale_px_per_mm)))
+                    cv2.rectangle(canvas, (p[0] - w_px_rect // 2, p[1] - h_px_rect // 2), (p[0] + w_px_rect // 2, p[1] + h_px_rect // 2), (20, 20, 20, 255), -1)
         elif item[0] == 'polygon':
-            if not all(distance_to_copper(pt[0], pt[1], copper_points) < dist_threshold for pt in item[1]):
-                continue
-            pts = np.array([to_px(pt[0], pt[1]) for pt in item[1]], np.int32).reshape((-1, 1, 2))
-            cv2.fillPoly(canvas, [pts], (20, 20, 20, 255))
+            if all(distance_to_copper(pt[0], pt[1], copper_points) < dist_threshold for pt in item[1]):
+                cv2.fillPoly(canvas, [np.array([to_px(pt[0], pt[1]) for pt in item[1]], np.int32).reshape((-1, 1, 2))], (20, 20, 20, 255))
 
-    # 3. Контур (Red)
     for item in parsed_data['cut']:
         if item[0] == 'line':
-            p1, p2 = to_px(item[1][0], item[1][1]), to_px(item[1][2], item[1][3])
-            w = max(1, int(round(item[2] * scale_px_per_mm)))
-            cv2.line(canvas, p1, p2, (255, 0, 0, 255), w)
+            cv2.line(canvas, to_px(item[1][0], item[1][1]), to_px(item[1][2], item[1][3]), (255, 0, 0, 255), max(1, int(round(item[2] * scale_px_per_mm))))
 
-    # 4. Отверстия (Blue)
-    for x, y, r in parsed_data['holes']:
-        p = to_px(x, y)
-        r_px = max(1, int(round(r * scale_px_per_mm)))
-        cv2.circle(canvas, p, r_px, (0, 80, 255, 255), -1)
+    # Цвета отверстий в RGBA (Синий, Голубой, Пурпурный, Желтый, Оранжевый)
+    hole_colors = [
+        (0, 0, 255, 255),     
+        (0, 255, 255, 255),   
+        (255, 0, 255, 255),   
+        (255, 255, 0, 255),   
+        (255, 165, 0, 255)    
+    ]
+
+    # Отрисовка отверстий с привязкой к ближайшему цвету
+    if top_5_diams:
+        for x, y, r in parsed_data['holes']:
+            p = to_px(x, y)
+            d = round(r * 2.0, 3)
+            closest_d = min(top_5_diams, key=lambda target: abs(target - d))
+            color_idx = top_5_diams.index(closest_d)
+            
+            r_px = max(1, int(round((closest_d / 2.0) * scale_px_per_mm)))
+            cv2.circle(canvas, p, r_px, hole_colors[color_idx], -1)
 
     logger.info("Successfully finished Gerber/Excellon rasterization.")
-    return canvas, width_mm, height_mm
+    return canvas, width_mm, height_mm, ui_diams

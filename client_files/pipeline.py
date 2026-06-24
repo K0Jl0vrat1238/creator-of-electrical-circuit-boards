@@ -19,11 +19,10 @@ GreenMode = Literal["scanline", "contour-offset", "centerline"]
 class PipelineError(ValueError):
     """Domain error for invalid input or impossible toolpaths."""
 
-
 def compose_layers_to_image(layers_paths: dict[str, Path], output_path: Path) -> Path:
     """
     Объединяет отдельные растровые слои в одно четырехканальное изображение RGBA
-    и сохраняет его по указанному пути. Используется как в GUI, так и в headless-режиме.
+    и сохраняет его по указанному пути. Слой 'holes' сохраняет свои оригинальные цвета.
     """
     images = {}
     max_w, max_h = 0, 0
@@ -33,22 +32,58 @@ def compose_layers_to_image(layers_paths: dict[str, Path], output_path: Path) ->
             continue
             
         raw = np.fromfile(str(path), dtype=np.uint8)
-        img = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            continue
         
-        # Автоматическая инверсия, если изображение имеет темный фон
-        corners = [int(img[0, 0]), int(img[0, -1]), int(img[-1, 0]), int(img[-1, -1])]
-        if sum(corners) / 4.0 < 128:
-            img = cv2.bitwise_not(img)
+        if layer_name == 'holes':
+            # Для отверстий сохраняем цветность (поддержка 5 цветов)
+            img = cv2.imdecode(raw, cv2.IMREAD_UNCHANGED)
+            if img is None: continue
             
-        _, mask = cv2.threshold(img, 150, 255, cv2.THRESH_BINARY_INV)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        h, w = mask.shape 
-        if w > max_w: max_w = w
-        if h > max_h: max_h = h
-        images[layer_name] = mask
+            # --- Легаси поддержка инверсии старых бинарных изображений ---
+            if img.ndim == 2: 
+                corners = [int(img[0, 0]), int(img[0, -1]), int(img[-1, 0]), int(img[-1, -1])]
+                if sum(corners) / 4.0 < 128:
+                    img = cv2.bitwise_not(img)
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGBA)
+            elif img.shape[2] == 3: img = cv2.cvtColor(img, cv2.COLOR_BGR2RGBA)
+            elif img.shape[2] == 4: img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+            
+            rgb = img[:, :, :3]
+            alpha = img[:, :, 3] if img.shape[2] == 4 else np.full(img.shape[:2], 255, dtype=np.uint8)
+            # Считаем белый фон прозрачным
+            is_white = (rgb[:,:,0] > 200) & (rgb[:,:,1] > 200) & (rgb[:,:,2] > 200)
+            mask = (alpha > 50) & (~is_white)
+            
+            # --- Конвертация старых Ч/Б отверстий в синий цвет ---
+            if np.any(mask):
+                masked_rgb = rgb[mask].astype(np.int16)
+                # Вычисляем максимальную разницу между каналами RGB для каждого пикселя
+                color_diffs = np.max(masked_rgb, axis=1) - np.min(masked_rgb, axis=1)
+                
+                # Если разница меньше 20, значит пиксели серые/черные (нет выраженного цвета)
+                if np.max(color_diffs) < 20:
+                    # Принудительно закрашиваем все отверстия в синий цвет (соответствует первому сверлу)
+                    img[mask] = [0, 0, 255, 255]
+            # -----------------------------------------------------
+            
+            h, w = mask.shape
+            max_w, max_h = max(max_w, w), max(max_h, h)
+            images['holes'] = (mask, img)
+        else:
+            # Остальные слои черно-белые
+            img = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+            if img is None: continue
+            
+            corners = [int(img[0, 0]), int(img[0, -1]), int(img[-1, 0]), int(img[-1, -1])]
+            if sum(corners) / 4.0 < 128:
+                img = cv2.bitwise_not(img)
+                
+            _, mask = cv2.threshold(img, 150, 255, cv2.THRESH_BINARY_INV)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            
+            h, w = mask.shape 
+            max_w, max_h = max(max_w, w), max(max_h, h)
+            images[layer_name] = mask
 
     if not images:
         raise PipelineError("Не удалось прочитать ни один слой для сборки изображения.")
@@ -58,10 +93,18 @@ def compose_layers_to_image(layers_paths: dict[str, Path], output_path: Path) ->
         'green': [0, 255, 0, 255],
         'paths': [0, 0, 0, 255],
         'cut':   [255, 0, 0, 255],
-        'holes': [0, 0, 255, 255]
     }
+    
     for layer_name in ['green', 'paths', 'cut', 'holes']:
-        if layer_name in images:
+        if layer_name not in images: continue
+        
+        if layer_name == 'holes':
+            mask, rgba_img = images['holes']
+            h, w = mask.shape
+            off_y, off_x = (max_h - h) // 2, (max_w - w) // 2
+            roi = composed[off_y:off_y+h, off_x:off_x+w]
+            roi[mask] = rgba_img[mask]
+        else:
             mask = images[layer_name]
             h, w = mask.shape
             off_y, off_x = (max_h - h) // 2, (max_w - w) // 2
@@ -83,7 +126,7 @@ class PipelineConfig:
     width_mm: float | None
     height_mm: float | None
     tool_angle_deg: float          
-    drill_diameter_mm: float
+    drill_diameters_mm: list[float]  # 5 диаметров под разные цвета
     stepover_percent: float
     simplify_tolerance_mm: float
     green_mode: GreenMode
@@ -92,11 +135,10 @@ class PipelineConfig:
     max_accel_mm_s2: float
     trace_depth_mm: float
     green_depth_mm: float
-    skip_validation: bool = False  # Флаг пропуска блокирующих проверок
+    skip_validation: bool = False
 
     @classmethod
     def from_yaml(cls, path: Path, skip_validation: bool = False) -> PipelineConfig:
-        """Считывает настройки из файла YAML и конструирует объект PipelineConfig."""
         if not path.exists():
             raise FileNotFoundError(f"Файл конфигурации не найден: {path}")
             
@@ -114,40 +156,31 @@ class PipelineConfig:
 
         dims = data.get("physical_dimensions", {})
         resolved_from = dims.get("resolved_from", "width")
-        width_mm = None
-        height_mm = None
+        width_mm, height_mm = None, None
         if resolved_from == "width" and "width_mm" in dims:
             width_mm = float(dims["width_mm"])
         elif resolved_from == "height" and "height_mm" in dims:
             height_mm = float(dims["height_mm"])
 
-        # Сценарий 1: Прямой путь к готовому изображению
         if img_path_str:
             img_path = Path(img_path_str)
             if not img_path.is_absolute():
                 img_path = (path.parent / img_path).resolve()
-
-        # Сценарий 2: Описание отдельных растровых слоев в YAML
         elif layers_data:
             resolved_layers = {}
             for layer_name, layer_path_str in layers_data.items():
                 if layer_path_str:
                     lp = Path(layer_path_str)
-                    if not lp.is_absolute():
-                        lp = (path.parent / lp).resolve()
+                    if not lp.is_absolute(): lp = (path.parent / lp).resolve()
                     resolved_layers[layer_name] = lp
-            
             temp_output_path = path.parent / "composed_source.png"
             img_path = compose_layers_to_image(resolved_layers, temp_output_path)
-
-        # Сценарий 3: Описание векторных Gerber/Excellon слоев в YAML
-        else:  # gerber_data
+        else:  
             resolved_gerber = {}
             for layer_name, layer_path_str in gerber_data.items():
                 if layer_path_str:
                     lp = Path(layer_path_str)
-                    if not lp.is_absolute():
-                        lp = (path.parent / lp).resolve()
+                    if not lp.is_absolute(): lp = (path.parent / lp).resolve()
                     resolved_gerber[layer_name] = lp
             
             from gerber_importer import render_gerber_and_excellon
@@ -155,18 +188,27 @@ class PipelineConfig:
             
             temp_output_path = path.parent / "composed_source.png"
             is_success, buffer = cv2.imencode(".png", cv2.cvtColor(composed, cv2.COLOR_RGBA2BGRA))
-            if not is_success:
-                raise ValueError("Ошибка сохранения временного растрового изображения из Gerber.")
+            if not is_success: raise ValueError("Ошибка сохранения временного растрового изображения из Gerber.")
             buffer.tofile(str(temp_output_path))
             img_path = temp_output_path
             
-            # Если размеры не заданы жестко, берем их напрямую из векторов Gerber
             if width_mm is None and height_mm is None:
                 width_mm = g_width_mm
 
         tools = data.get("tool_parameters", {})
         gcode = data.get("gcode_generation", {})
         
+        old_drill = tools.get("drill_diameter_mm")
+        drill_diams = tools.get("drill_diameters_mm")
+        if drill_diams is not None and isinstance(drill_diams, list):
+            drill_diams = (drill_diams + [0.0]*5)[:5]
+        elif old_drill is not None:
+            drill_diams = [float(old_drill), 0.0, 0.0, 0.0, 0.0]
+        else:
+            drill_diams = [0.8, 1.0, 1.2, 1.5, 2.0]
+            
+        drill_diams = [float(x) for x in drill_diams]
+
         override_validation = skip_validation or gcode.get("skip_validation", False)
         
         return cls(
@@ -174,7 +216,7 @@ class PipelineConfig:
             width_mm=width_mm,
             height_mm=height_mm,
             tool_angle_deg=float(tools.get("angle_deg", 30.0)),
-            drill_diameter_mm=float(tools.get("drill_diameter_mm", 0.8)),
+            drill_diameters_mm=drill_diams,
             stepover_percent=float(tools.get("stepover_percent", 50.0)),
             simplify_tolerance_mm=float(tools.get("simplify_tolerance_mm", 0.0)),
             green_mode=tools.get("green_mode", "centerline"),
@@ -186,12 +228,12 @@ class PipelineConfig:
             skip_validation=override_validation
         )
 
-
 @dataclass(frozen=True)
 class HoleCircle:
     x_px: float
     y_px: float
     radius_px: float
+    color: tuple[int, int, int]  # RGB
 
 @dataclass(frozen=True)
 class PipelineResult:
@@ -209,36 +251,27 @@ class PipelineResult:
     warnings: list[str]
 
 def _calc_effective_radius_mm(depth_mm: float, angle_deg: float) -> float:
-    """Эффективный радиус V-фрезы: r = depth * tan(angle/2)"""
-    if depth_mm <= 0 or angle_deg <= 0 or angle_deg >= 180:
-        return 0.0
+    if depth_mm <= 0 or angle_deg <= 0 or angle_deg >= 180: return 0.0
     return depth_mm * math.tan(math.radians(angle_deg / 2.0))
 
-
 # --- Вспомогательные функции топологического анализа ---
-
 def _rasterize_vector_paths(paths: list[list[tuple[float, float]]], width: int, height: int, thickness_px: int) -> np.ndarray:
     mask = np.zeros((height, width), dtype=np.uint8)
     for path in paths:
-        if len(path) < 2:
-            continue
+        if len(path) < 2: continue
         pts = np.array([[int(round(x)), int(round(y))] for x, y in path], np.int32).reshape((-1, 1, 2))
         cv2.polylines(mask, [pts], isClosed=False, color=255, thickness=thickness_px, lineType=cv2.LINE_AA)
     return mask > 0
 
 def _get_components(mask: np.ndarray) -> dict[int, np.ndarray]:
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        (mask.astype(np.uint8) * 255).astype(np.uint8), connectivity=8
-    )
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((mask.astype(np.uint8) * 255).astype(np.uint8), connectivity=8)
     comps = {}
     for idx in range(1, num_labels):
-        if stats[idx, cv2.CC_STAT_AREA] > 5:
-            comps[idx] = labels == idx
+        if stats[idx, cv2.CC_STAT_AREA] > 5: comps[idx] = labels == idx
     return comps
 
 def _fill_internal_holes(mask: np.ndarray) -> np.ndarray:
-    if mask.sum() == 0:
-        return mask
+    if mask.sum() == 0: return mask
     padded = np.pad(mask, pad_width=1, mode='constant', constant_values=False)
     h, w = padded.shape
     flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
@@ -248,8 +281,7 @@ def _fill_internal_holes(mask: np.ndarray) -> np.ndarray:
     return np.logical_or(padded, holes)[1:-1, 1:-1]
 
 def _analyze_topology_internal(gt_comps: dict[int, np.ndarray], vec_comps: dict[int, np.ndarray], min_overlap_ratio: float = 0.05):
-    breaks = []
-    shorts = []
+    breaks, shorts = [], []
     vec_to_gt = {v_id: [] for v_id in vec_comps}
     gt_to_vec = {g_id: [] for g_id in gt_comps}
     for v_id, v_mask in vec_comps.items():
@@ -260,30 +292,19 @@ def _analyze_topology_internal(gt_comps: dict[int, np.ndarray], vec_comps: dict[
                 vec_to_gt[v_id].append(g_id)
                 gt_to_vec[g_id].append(v_id)
     for g_id, v_ids in gt_to_vec.items():
-        if len(v_ids) == 0:
-            breaks.append(f"Дорожка #{g_id} полностью потеряна.")
-        elif len(v_ids) > 1:
-            breaks.append(f"Дорожка #{g_id} разорвана на {len(v_ids)} частей.")
+        if len(v_ids) == 0: breaks.append(f"Дорожка #{g_id} полностью потеряна.")
+        elif len(v_ids) > 1: breaks.append(f"Дорожка #{g_id} разорвана на {len(v_ids)} частей.")
     for v_id, g_ids in vec_to_gt.items():
-        if len(g_ids) > 1:
-            shorts.append(f"Замыкание: непреднамеренное объединение дорожек {g_ids}.")
+        if len(g_ids) > 1: shorts.append(f"Замыкание: непреднамеренное объединение дорожек {g_ids}.")
     return breaks, shorts
 
 def _validate_topology_and_collisions(
-    gt_masks: dict[str, np.ndarray],
-    black_paths: list[list[tuple[float, float]]],
-    cut_paths: list[list[tuple[float, float]]],
-    width_px: int,
-    height_px: int,
-    black_radius_px: float,
-    cut_radius_px: float,
-    skip_validation: bool,
-    warnings_list: list[str]
+    gt_masks: dict[str, np.ndarray], black_paths: list[list[tuple[float, float]]], cut_paths: list[list[tuple[float, float]]],
+    width_px: int, height_px: int, black_radius_px: float, cut_radius_px: float, skip_validation: bool, warnings_list: list[str]
 ) -> None:
     logger.info("Executing topological consistency checks...")
     errors = []
 
-    # 1. Валидация дорожек (BLACK)
     gt_black = gt_masks.get("black")
     if gt_black is not None and gt_black.sum() > 0:
         thickness_px = max(1, int(round(black_radius_px * 2)))
@@ -291,10 +312,8 @@ def _validate_topology_and_collisions(
         gt_comps = _get_components(gt_black)
         vec_comps = _get_components(vec_black_mask)
         breaks, shorts = _analyze_topology_internal(gt_comps, vec_comps)
-        errors.extend(breaks)
-        errors.extend(shorts)
+        errors.extend(breaks); errors.extend(shorts)
 
-    # 2. Валидация контура реза (RED)
     gt_red = gt_masks.get("red")
     if gt_red is not None and gt_red.sum() > 0:
         thickness_px = max(1, int(round(cut_radius_px * 2)))
@@ -303,38 +322,25 @@ def _validate_topology_and_collisions(
         vec_red_filled = _fill_internal_holes(vec_red_mask)
         vec_comps = _get_components(vec_red_filled)
         breaks, _ = _analyze_topology_internal(gt_comps, vec_comps)
-        if breaks:
-            errors.extend([f"Ошибка контура платы: {b}" for b in breaks])
+        if breaks: errors.extend([f"Ошибка контура платы: {b}" for b in breaks])
 
-    # 3. Валидация пересечений контура (RED) и дорожек (BLACK)
     if gt_black is not None and gt_black.sum() > 0:
         thickness_px = max(1, int(round(cut_radius_px * 2)))
         vec_red_mask = _rasterize_vector_paths(cut_paths, width_px, height_px, thickness_px)
         overlap = np.logical_and(gt_black, vec_red_mask)
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-            (overlap.astype(np.uint8) * 255), connectivity=8
-        )
-        collisions = 0
-        for i in range(1, num_labels):
-            if stats[i, cv2.CC_STAT_AREA] > 3:
-                collisions += 1
-        if collisions > 0:
-            errors.append(f"Коллизия: обнаружено {collisions} пересечений контурной фрезы с дорожками.")
+        num_labels, _, stats, _ = cv2.connectedComponentsWithStats((overlap.astype(np.uint8) * 255), connectivity=8)
+        collisions = sum(1 for i in range(1, num_labels) if stats[i, cv2.CC_STAT_AREA] > 3)
+        if collisions > 0: errors.append(f"Коллизия: обнаружено {collisions} пересечений контурной фрезы с дорожками.")
 
     if errors:
         if skip_validation:
             logger.warning(f"Bypassing {len(errors)} errors due to skip_validation flag.")
-            for err in errors:
-                warnings_list.append(f"[Игнорировано] {err}")
+            for err in errors: warnings_list.append(f"[Игнорировано] {err}")
         else:
             logger.error(f"Topological consistency checks failed with {len(errors)} issues.")
             raise PipelineError("Обнаружены критические дефекты трассировки:\n\n" + "\n".join(errors))
-    else:
-        logger.info("Topological verification passed successfully.")
-
 
 # --- Основной конвейер ---
-
 def run_pipeline(config: PipelineConfig) -> PipelineResult:
     logger.info("Pipeline thread started.")
     warnings_list = []
@@ -350,17 +356,11 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     raw_masks = _classify_color_masks(rgba)
     masks = _segment_color_masks(rgba, raw_masks=raw_masks)
     
-    # Проверка на пересечение цветов
-    try:
-        _validate_color_overlaps(masks)
+    try: _validate_color_overlaps(masks)
     except PipelineError as e:
-        if config.skip_validation:
-            logger.warning(f"Ignored color overlap check: {e}")
-            warnings_list.append(f"[Игнорировано] {e}")
-        else:
-            raise e
+        if config.skip_validation: warnings_list.append(f"[Игнорировано] {e}")
+        else: raise e
 
-    drill_radius_px = (config.drill_diameter_mm * px_per_mm) / 2.0
     green_r_mm = _calc_effective_radius_mm(config.green_depth_mm, config.tool_angle_deg)
     black_r_mm = _calc_effective_radius_mm(config.trace_depth_mm, config.tool_angle_deg)
     cut_r_mm = _calc_effective_radius_mm(config.stock_thickness_mm, config.tool_angle_deg)
@@ -369,118 +369,77 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     black_tool_radius_px = black_r_mm * px_per_mm
     cut_tool_radius_px = cut_r_mm * px_per_mm
 
-    logger.debug(
-        f"Calculated px radii: drill={drill_radius_px:.2f}, "
-        f"green_tool={green_tool_radius_px:.2f}, "
-        f"black_tool={black_tool_radius_px:.2f}, "
-        f"cut_tool={cut_tool_radius_px:.2f}"
-    )
-
     green_stepover_px = max(1.0, (config.stepover_percent / 100.0) * 2.0 * green_tool_radius_px)
     simplify_tolerance_px = max(0.0, config.simplify_tolerance_mm * px_per_mm)
 
     logger.info("Detecting drill holes centers...")
-    hole_centers = _detect_hole_centers(masks["blue"], drill_radius_px)
-    holes = [HoleCircle(x, y, drill_radius_px) for x, y in hole_centers]
-    holes = _merge_hole_clusters(holes)
-    logger.info(f"Deduplicated and merged drill holes count: {len(holes)}")
+    holes = []
+    hole_specs = [
+        ("hole_1", masks["hole_1"], config.drill_diameters_mm[0], (0, 0, 255)),     # Синий
+        ("hole_2", masks["hole_2"], config.drill_diameters_mm[1], (0, 255, 255)),   # Голубой
+        ("hole_3", masks["hole_3"], config.drill_diameters_mm[2], (255, 0, 255)),   # Пурпурный
+        ("hole_4", masks["hole_4"], config.drill_diameters_mm[3], (255, 255, 0)),   # Желтый
+        ("hole_5", masks["hole_5"], config.drill_diameters_mm[4], (255, 165, 0)),   # Оранжевый
+    ]
+    
+    for name, mask, d_mm, color in hole_specs:
+        if d_mm > 0:
+            drill_r_px = (d_mm * px_per_mm) / 2.0
+            centers = _detect_hole_centers(mask, drill_r_px)
+            color_holes = [HoleCircle(x, y, drill_r_px, color) for x, y in centers]
+            color_holes = _merge_hole_clusters(color_holes)
+            holes.extend(color_holes)
+
+    logger.info(f"Total deduplicated drill holes: {len(holes)}")
 
     hole_exclusion = _hole_exclusion_mask(masks["green"].shape, holes)
     black_pad_exclusion = _hole_pad_exclusion_mask(raw_masks["black"], holes)
     black_collision_mask = _clean_mask(
-        raw_masks["black"] & (~black_pad_exclusion),
-        min_area=max(2, (rgba.shape[0] * rgba.shape[1]) // 80000),
-        do_close=False,
-        do_open=False,
+        raw_masks["black"] & (~black_pad_exclusion), min_area=max(2, (rgba.shape[0] * rgba.shape[1]) // 80000), do_close=False, do_open=False
     )
 
     black_geometry = _mask_to_geometry(masks["black"])
     
-    # Проверка на коллизии сверла с медными дорожками
-    try:
-        _validate_drill_collision_mask(holes, black_collision_mask)
+    try: _validate_drill_collision_mask(holes, black_collision_mask)
     except PipelineError as e:
-        if config.skip_validation:
-            logger.warning(f"Ignored drill collision check: {e}")
-            warnings_list.append(f"[Игнорировано] {e}")
-        else:
-            raise e
+        if config.skip_validation: warnings_list.append(f"[Игнорировано] {e}")
+        else: raise e
 
     logger.info(f"Generating green layer (engraving) with mode: '{config.green_mode}'...")
-    green_paths = _green_paths(
-        masks["green"],
-        hole_exclusion=hole_exclusion,
-        tool_radius_px=green_tool_radius_px,
-        stepover_px=green_stepover_px,
-        mode=config.green_mode,
-        simplify_tolerance_px=simplify_tolerance_px,
-    )
-    logger.info(f"Green layer: {len(green_paths)} vector path segments generated.")
-
+    green_paths = _green_paths(masks["green"], hole_exclusion=hole_exclusion, tool_radius_px=green_tool_radius_px, stepover_px=green_stepover_px, mode=config.green_mode, simplify_tolerance_px=simplify_tolerance_px)
     logger.info("Generating copper trace isolation paths (black)...")
-    black_paths = _black_paths(
-        black_geometry,
-        holes=holes,
-        tool_radius_px=black_tool_radius_px,
-        simplify_tolerance_px=simplify_tolerance_px,
-    )
-    logger.info(f"Black layer: {len(black_paths)} vector path segments generated.")
-
+    black_paths = _black_paths(black_geometry, holes=holes, tool_radius_px=black_tool_radius_px, simplify_tolerance_px=simplify_tolerance_px)
     logger.info("Generating board outline paths (red)...")
-    cut_paths = _cut_paths(
-        masks["red"],
-        simplify_tolerance_px=simplify_tolerance_px,
-    )
-    logger.info(f"Red layer: {len(cut_paths)} vector path segments generated.")
+    cut_paths = _cut_paths(masks["red"], simplify_tolerance_px=simplify_tolerance_px)
 
-    if not holes:
-        warnings_list.append("Слой отверстий (Blue) не обнаружен.")
-    if not green_paths:
-        warnings_list.append("Слой текста/шелкографии (Green) не обнаружен.")
-    if not black_paths:
-        warnings_list.append("Слой проводящих дорожек (Black) не обнаружен.")
-    if not cut_paths:
-        warnings_list.append("Слой контура обрезки (Red) не обнаружен.")
+    if not holes: warnings_list.append("Слой отверстий (сверла) пуст.")
+    if not green_paths: warnings_list.append("Слой текста/шелкографии (Green) пуст.")
+    if not black_paths: warnings_list.append("Слой проводящих дорожек (Black) пуст.")
+    if not cut_paths: warnings_list.append("Слой контура обрезки (Red) пуст.")
     
     if not (holes or green_paths or black_paths or cut_paths):
         raise PipelineError("Не найдено ни одного рабочего слоя (отверстия, текст, дорожки или контур).")
 
-    # Топологическая валидация
     _validate_topology_and_collisions(
-        gt_masks=masks,
-        black_paths=black_paths,
-        cut_paths=cut_paths,
-        width_px=width_px,
-        height_px=height_px,
-        black_radius_px=black_tool_radius_px,
-        cut_radius_px=cut_tool_radius_px,
-        skip_validation=config.skip_validation,
-        warnings_list=warnings_list,
+        gt_masks=masks, black_paths=black_paths, cut_paths=cut_paths,
+        width_px=width_px, height_px=height_px,
+        black_radius_px=black_tool_radius_px, cut_radius_px=cut_tool_radius_px,
+        skip_validation=config.skip_validation, warnings_list=warnings_list,
     )
     
     logger.info("Pipeline processing completed successfully.")
     return PipelineResult(
-        width_px=width_px,
-        height_px=height_px,
-        width_mm=width_mm,
-        height_mm=height_mm,
-        holes=holes,
-        green_paths=green_paths,
-        black_paths=black_paths,
-        cut_paths=cut_paths,
-        green_tool_radius_px=green_tool_radius_px,
-        black_tool_radius_px=black_tool_radius_px,
-        cut_tool_radius_px=cut_tool_radius_px,
+        width_px=width_px, height_px=height_px, width_mm=width_mm, height_mm=height_mm,
+        holes=holes, green_paths=green_paths, black_paths=black_paths, cut_paths=cut_paths,
+        green_tool_radius_px=green_tool_radius_px, black_tool_radius_px=black_tool_radius_px, cut_tool_radius_px=cut_tool_radius_px,
         warnings=warnings_list,
     )
 
 def _validate_config(config: PipelineConfig) -> None:
     if config.green_mode not in {"scanline", "contour-offset", "centerline"}:
         raise PipelineError("Режим green должен быть scanline, contour-offset или centerline.")
-        
     numeric_checks = {
         "Угол фрезы": config.tool_angle_deg,
-        "Диаметр сверла": config.drill_diameter_mm,
         "Stepover %": config.stepover_percent,
         "Толщина заготовки": config.stock_thickness_mm,
         "Скорость реза": config.cut_speed_mm_s,
@@ -490,6 +449,8 @@ def _validate_config(config: PipelineConfig) -> None:
     }
     for name, value in numeric_checks.items():
         if value <= 0: raise PipelineError(f"{name} должно быть > 0.")
+    for d in config.drill_diameters_mm:
+        if d < 0: raise PipelineError("Диаметры сверл не могут быть отрицательными.")
     if not (0 < config.tool_angle_deg < 180): raise PipelineError("Угол фрезы должен быть в диапазоне (0, 180) градусов.")
     if config.simplify_tolerance_mm < 0: raise PipelineError("Допуск упрощения не может быть отрицательным.")
     if not (1 <= config.stepover_percent <= 100): raise PipelineError("Stepover должен быть в диапазоне 1..100%.")
@@ -520,22 +481,34 @@ def _classify_color_masks(rgba: np.ndarray) -> dict[str, np.ndarray]:
     rgb = cv2.bilateralFilter(rgb, d=7, sigmaColor=50, sigmaSpace=50)
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    
     transparent, white_like = alpha < 128, (rgb[:, :, 0] > 190) & (rgb[:, :, 1] > 190) & (rgb[:, :, 2] > 190)
     neutral_light_bg = (s < 45) & (v > 130)
     ignored = transparent | white_like | neutral_light_bg
-    red = ((((h <= 12) | (h >= 170)) & (s >= 60) & (v >= 40)) & (~ignored))
-    green = (((h >= 35) & (h <= 95) & (s >= 60) & (v >= 40)) & (~ignored))
-    blue = (((h >= 90) & (h <= 145) & (s >= 60) & (v >= 40)) & (~ignored))
+    
+    # Распределение тонов по цветовому кругу (HSV в OpenCV 0..179)
+    hole_5 = (((h >= 8) & (h <= 21)) & (s >= 60) & (v >= 40) & (~ignored))      # Orange
+    hole_4 = (((h >= 22) & (h <= 34)) & (s >= 60) & (v >= 40) & (~ignored))     # Yellow
+    green  = (((h >= 35) & (h <= 79)) & (s >= 60) & (v >= 40) & (~ignored))     # Green (Silk)
+    hole_2 = (((h >= 80) & (h <= 104)) & (s >= 60) & (v >= 40) & (~ignored))    # Cyan
+    hole_1 = (((h >= 105) & (h <= 135)) & (s >= 60) & (v >= 40) & (~ignored))   # Blue
+    hole_3 = (((h >= 136) & (h <= 165)) & (s >= 60) & (v >= 40) & (~ignored))   # Magenta
+    red = ((((h <= 7) | (h >= 166)) & (s >= 60) & (v >= 40)) & (~ignored))      # Red (Cut)
     black = ((v <= 105) & (~ignored))
-    assigned = red | green | blue | black
+    
+    assigned = hole_1 | hole_2 | hole_3 | hole_4 | hole_5 | green | red | black
     black = black | ((~ignored) & (~assigned) & (s < 55))
-    return {"blue": blue, "green": green, "red": red, "black": black}
+    
+    return {
+        "hole_1": hole_1, "hole_2": hole_2, "hole_3": hole_3, "hole_4": hole_4, "hole_5": hole_5,
+        "green": green, "red": red, "black": black
+    }
 
 def _segment_color_masks(rgba: np.ndarray, raw_masks: dict[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:
     masks, cleaned, area = raw_masks if raw_masks is not None else _classify_color_masks(rgba), {}, rgba.shape[0] * rgba.shape[1]
     for name, mask in masks.items():
         if name == "black": min_a, do_c, do_o = max(4, area // 35000), True, False
-        elif name == "blue": min_a, do_c, do_o = max(4, area // 45000), False, True
+        elif name.startswith("hole_"): min_a, do_c, do_o = max(4, area // 45000), False, True
         elif name == "green": min_a, do_c, do_o = max(4, area // 45000), True, False
         else: min_a, do_c, do_o = max(8, area // 22000), False, True
         cleaned[name] = _clean_mask(mask, min_a, do_c, do_o)
@@ -555,8 +528,8 @@ def _validate_color_overlaps(masks: dict[str, np.ndarray]) -> None:
     if np.any(masks["red"] & masks["green"]) or np.any(masks["red"] & masks["black"]) or np.any(masks["green"] & masks["black"]):
         raise PipelineError("Обнаружено пересечение слоев (перекрытия red/green/black).")
 
-def _detect_hole_centers(blue_mask: np.ndarray, drill_radius_px: float) -> list[tuple[float, float]]:
-    src = (blue_mask.astype(np.uint8) * 255).astype(np.uint8)
+def _detect_hole_centers(target_mask: np.ndarray, drill_radius_px: float) -> list[tuple[float, float]]:
+    src = (target_mask.astype(np.uint8) * 255).astype(np.uint8)
     if not np.any(src): return []
     blurred, min_dist = cv2.medianBlur(src, 5), max(4.0, drill_radius_px * 1.1)
     circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=min_dist, param1=60, param2=6, minRadius=max(1, int(round(drill_radius_px * 0.2))), maxRadius=max(2, int(round(drill_radius_px * 3.2))))
@@ -613,32 +586,21 @@ def _black_paths(
     offset = black_geometry.buffer(tool_radius_px, quad_segs=16)
     return _simplify_paths(_polygon_boundary_paths_without_hole_interiors(offset, [Point(h.x_px, h.y_px) for h in holes]), simplify_tolerance_px)
 
-def _cut_paths(
-    red_mask: np.ndarray, simplify_tolerance_px: float
-) -> list[list[tuple[float, float]]]:
-    if not np.any(red_mask):
-        return []
-
+def _cut_paths(red_mask: np.ndarray, simplify_tolerance_px: float) -> list[list[tuple[float, float]]]:
+    if not np.any(red_mask): return []
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     closed = cv2.morphologyEx((red_mask.astype(np.uint8) * 255), cv2.MORPH_CLOSE, kernel)
-
     h, w = closed.shape
     padded = np.pad(closed, pad_width=2, mode='constant', constant_values=0)
     flood_mask = np.zeros((h + 6, w + 6), dtype=np.uint8)
-    
     cv2.floodFill(padded, flood_mask, (0, 0), 255)
     solid_board = cv2.bitwise_not(padded)[2:-2, 2:-2]
-
     geom = _mask_to_geometry(solid_board > 0)
-    if geom.is_empty:
-        return []
-
+    if geom.is_empty: return []
     paths: list[list[tuple[float, float]]] = []
     for poly in _iter_polygons(geom):
         ext = list(poly.exterior.coords)
-        if len(ext) >= 2:
-            paths.append([(float(x), float(y)) for x, y in ext])
-            
+        if len(ext) >= 2: paths.append([(float(x), float(y)) for x, y in ext])
     return _simplify_paths(paths, simplify_tolerance_px)
 
 def _erode_for_tool_center(mask: np.ndarray, radius_px: float) -> np.ndarray:
@@ -660,7 +622,7 @@ def _scanline_fill_component(mask: np.ndarray, stepover_px: float) -> list[list[
             start = x
             while x < w and row[x]: x += 1
             if (x - 1) > start: segments.append((float(start), float(x - 1)))
-        if reverse: segments = list(reversed(reversed_seg := segments)) # minor ref.
+        if reverse: segments = list(reversed(reversed_seg := segments))
         for idx, (start, end) in enumerate(segments):
             seg_start, seg_end = ((end + 0.5, y + 0.5), (start + 0.5, y + 0.5)) if reverse else ((start + 0.5, y + 0.5), (end + 0.5, y + 0.5))
             if not current_path: current_path.extend([seg_start, seg_end]); continue
@@ -833,5 +795,7 @@ def _merge_hole_clusters(holes: list[HoleCircle]) -> list[HoleCircle]:
                 cluster.append(curr)
                 for neighbor in adj[curr]:
                     if neighbor not in visited: visited.add(neighbor); q.append(neighbor)
-            merged.append(HoleCircle(sum(holes[idx].x_px for idx in cluster) / len(cluster), sum(holes[idx].y_px for idx in cluster) / len(cluster), holes[cluster[0]].radius_px))
+            avg_x = sum(holes[idx].x_px for idx in cluster) / len(cluster)
+            avg_y = sum(holes[idx].y_px for idx in cluster) / len(cluster)
+            merged.append(HoleCircle(avg_x, avg_y, holes[cluster[0]].radius_px, holes[cluster[0]].color))
     return merged
