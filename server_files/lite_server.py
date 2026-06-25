@@ -40,6 +40,11 @@ class ZProbeRequest(BaseModel):
     V_MAX: Optional[float] = None
     A_MAX: Optional[float] = None
 
+class GcodeRequest(BaseModel):
+    commands: List[str]
+    V_MAX: Optional[float] = None
+    A_MAX: Optional[float] = None
+
     
 
 # ================= Настройки геометрии стола =================
@@ -536,6 +541,21 @@ def api_z_probe(req: ZProbeRequest):
     finally:
         cnc.is_busy = False
 
+@app.post("/api/v0/run_gcode")
+def api_run_gcode(req: GcodeRequest):
+    if cnc.is_busy: raise HTTPException(status_code=400, detail="Станок занят")
+    if not cnc.is_homed: raise HTTPException(status_code=400, detail="Сперва выполните паркинг")
+    cnc.is_busy = True
+    try:
+        cnc.run_gcode(req.commands, v_max=req.V_MAX, a_max=req.A_MAX)
+        return {"status": "success", "message": "G-код успешно выполнен", "current_pos": cnc.get_coordinates_mm()}
+    except RuntimeError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cnc.is_busy = False
+
 @app.get("/api/v0/get_coords")
 def api_get_coords():
     if not cnc.is_homed:
@@ -580,6 +600,9 @@ def api_stop():
     if hasattr(cnc, 'first_touch_z'):
         cnc.first_touch_z = None
     
+    cnc.gcode_commands = []
+    cnc.gcode_index = 0
+    
     cnc.shutdown()
     
     return {
@@ -604,7 +627,7 @@ def api_pause():
         }
     # Активируем стоп-флаг, чтобы циклы шагов прервались
     cnc.pause = True
-    if getattr(cnc, 'active_operation', None) == 'z_probe':
+    if getattr(cnc, 'active_operation', None) in ('z_probe', 'gcode'):
         cnc.resume_target = None
                 
     cnc.pause_motor()
@@ -634,14 +657,16 @@ def api_resume():
         if getattr(cnc, 'interrupted_operation', None) == 'z_probe':
             v_max = getattr(cnc, 'z_probe_v_max', None)
             a_max = getattr(cnc, 'z_probe_a_max', None)
-            # Запускаем пробинг в режиме возобновления
             result_points = cnc.z_probe_points([], v_max=v_max, a_max=a_max, is_resume=True)
-            return {
-                "status": "success",
-                "message": "Z-probing успешно возобновлен и завершен!",
-                "points": result_points,
-                "current_pos": cnc.get_coordinates_mm()
-            }
+            return {"status": "success", "points": result_points}
+            
+        # Возобновление G-кода
+        elif getattr(cnc, 'interrupted_operation', None) == 'gcode':
+            if getattr(cnc, 'resume_target', None):
+                target = cnc.resume_target
+                cnc.move_absolute(x=target['x'], y=target['y'], z=target['z'], diagonal=target.get('diagonal', False))
+            cnc.run_gcode([], is_resume=True)
+            return {"status": "success", "message": "G-код возобновлен"}
         else:
             # Обычное возобновление перемещения
             if not getattr(cnc, 'resume_target', None):

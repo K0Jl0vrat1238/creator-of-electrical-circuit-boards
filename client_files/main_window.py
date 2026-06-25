@@ -25,6 +25,33 @@ from workers import ApiWorker, FetchWorker, AutoPlacementWorker
 from widgets import GerberComposerDialog, LayerComposerDialog, LayerListWidget, PreviewView, Spline3DWidget
 from ip_by_mac import get_ip_by_mac
 
+from scipy.interpolate import NearestNDInterpolator, LinearNDInterpolator
+
+# --- Утилита для генерации G-кода ---
+class GCodeBuilder:
+    def __init__(self, feedrate=600):
+        self.lines = []
+        self.feedrate = feedrate
+    def raw(self, line): self.lines.append(line)
+    def motor_on(self): self.lines.append("M3")
+    def motor_off(self): self.lines.append("M5")
+    def set_feed(self, f):
+        self.feedrate = f
+        self.lines.append(f"F{f}")
+    def rapid(self, x=None, y=None, z=None):
+        parts = ["G0"]
+        if x is not None: parts.append(f"X{x:.3f}")
+        if y is not None: parts.append(f"Y{y:.3f}")
+        if z is not None: parts.append(f"Z{z:.3f}")
+        if len(parts) > 1: self.lines.append(" ".join(parts))
+    def feed(self, x=None, y=None, z=None, f=None):
+        parts = ["G1"]
+        if x is not None: parts.append(f"X{x:.3f}")
+        if y is not None: parts.append(f"Y{y:.3f}")
+        if z is not None: parts.append(f"Z{z:.3f}")
+        if f is not None: parts.append(f"F{f}")
+        if len(parts) > 1: self.lines.append(" ".join(parts))
+
 class MainWindow(QMainWindow):
     def __init__(self, skip_validation: bool = False) -> None:
         super().__init__()
@@ -55,6 +82,7 @@ class MainWindow(QMainWindow):
         self.placed_pcb_pos = QPointF(0, 0)
         self.placed_pcb_angle = 0.0
         self.placed_pcbs = []  
+        self._z_interpolator = None
 
         self._build_ui()
         self._setup_shortcuts()
@@ -328,11 +356,11 @@ class MainWindow(QMainWindow):
         self.btn_auto_place.clicked.connect(self._on_auto_placement_clicked)
         top_controls.addWidget(self.btn_auto_place)
 
-        self.btn_run_probing = QPushButton("📏 Сделать пробинг")
-        self.btn_run_probing.setEnabled(False)
-        self.btn_run_probing.setStyleSheet("background-color: #32a852; color: white;")
-        self.btn_run_probing.clicked.connect(self._on_run_probing_clicked)
-        top_controls.addWidget(self.btn_run_probing)
+        self.btn_fabricate = QPushButton("⚡ НАЧАТЬ ИЗГОТОВЛЕНИЕ")
+        self.btn_fabricate.setEnabled(False)
+        self.btn_fabricate.setStyleSheet("background-color: #0078D7; color: white; font-weight: bold;")
+        self.btn_fabricate.clicked.connect(self._start_fabrication_workflow)
+        top_controls.addWidget(self.btn_fabricate)
         top_controls.addStretch()
 
         layout.addLayout(top_controls)
@@ -569,7 +597,6 @@ class MainWindow(QMainWindow):
             self._update_placement_views()
             self.view_yolo.fit_to_scene()
             self.view_map.fit_to_scene()
-            self.btn_run_probing.setEnabled(False)
             if self.placement_segments_mm: self.btn_select_pixel.setEnabled(True)
             self.log_human(True, "Фото и миллиметровая проекция успешно загружены.")
             self._update_placement_buttons_state()
@@ -815,6 +842,7 @@ class MainWindow(QMainWindow):
         has_blank = any(str(det.get("name", "")).lower() == "blank" for det in self.placement_detections)
         self.btn_start_placement.setEnabled(has_pcb and has_blank)
         self.btn_auto_place.setEnabled(has_pcb and has_blank)
+        self.btn_fabricate.setEnabled(has_pcb and len(self.placed_pcbs) > 0)
 
     def _validate_placement_geometry(self, pos: QPointF, angle: float) -> str | None:
         pcb_exact = self._get_pcb_combined_path(pos, angle, margin=0.0)
@@ -860,7 +888,6 @@ class MainWindow(QMainWindow):
         
         self.placed_pcbs = []
         self._update_placement_views()
-        self.btn_run_probing.setEnabled(False)
         self.placement_active = True
         self.placed_pcb_angle = 0.0
         self.placed_pcb_pos = QPointF(0, 0)
@@ -922,14 +949,14 @@ class MainWindow(QMainWindow):
         self.placed_pcbs.append({'pos': self.placed_pcb_pos, 'angle': self.placed_pcb_angle})
         self.btn_start_placement.setChecked(False) 
         self._update_placement_views()
-        self.btn_run_probing.setEnabled(True)
+        self._update_placement_buttons_state()
         self.log_human(True, f"Плата зафиксирована (X: {self.placed_pcb_pos.x():.2f}, Y: {self.placed_pcb_pos.y():.2f}, Угол: {self.placed_pcb_angle:.1f}°)")
 
     def _set_placement_ui_locked(self, locked: bool):
         self.btn_fetch_photo.setEnabled(not locked)
         self.btn_select_pixel.setEnabled(not locked and bool(self.placement_segments_mm))
         self.btn_start_placement.setEnabled(not locked and self._last_result is not None)
-        self.btn_run_probing.setEnabled(not locked and bool(self.placed_pcbs))
+        # Кнопка ручного пробинга удалена, её состояние регулируется FAB-конвейером
         self.combo_model.setEnabled(not locked)
 
     def _on_auto_placement_clicked(self) -> None:
@@ -1029,9 +1056,8 @@ class MainWindow(QMainWindow):
         stroker.setWidth(margin * 2) 
         return blank_path.subtracted(stroker.createStroke(blank_path))
 
-    def _generate_probe_points(self) -> list[dict]:
-        placed = self.placed_pcbs[-1]
-        pcb_hull = self._get_pcb_convex_hull_physical(placed['pos'], placed['angle'])
+    def _generate_mill_probe_points(self, pos, angle, scale, cx, cy, drill_groups) -> list[dict]:
+        pcb_hull = self._get_pcb_convex_hull_physical(pos, angle)
         if pcb_hull.isEmpty(): return []
 
         stroker = QPainterPathStroker()
@@ -1048,6 +1074,14 @@ class MainWindow(QMainWindow):
         l_min_x, l_max_x = limits.get("x", {}).get("min", 0.0), limits.get("x", {}).get("max", 260.0)
         l_min_y, l_max_y = limits.get("y", {}).get("min", -160.0), limits.get("y", {}).get("max", 20.0)
 
+        # Сбор зон отверстий для их исключения из карты высот гравировки
+        hole_exclusion_areas = []
+        for d_mm, holes in drill_groups.items():
+            r_mm = (d_mm / 2.0) * 1.01
+            for h in holes:
+                mx, my = self._map_px_to_physical(h.x_px, h.y_px, pos, angle, scale, cx, cy)
+                hole_exclusion_areas.append((mx, my, r_mm))
+
         bbox = pcb_expanded.boundingRect()
         grid_step = 10.0 
         points = []
@@ -1057,64 +1091,234 @@ class MainWindow(QMainWindow):
                 if not (l_min_x <= x <= l_max_x and l_min_y <= y <= l_max_y): continue
                 pt = QPointF(x, y)
                 if pcb_expanded.contains(pt) and blank_safe.contains(pt) and not danger_zone.contains(pt):
-                    points.append({"x": round(float(x), 3), "y": round(float(y), 3)})
-
-        if not points:
-            center = bbox.center()
-            if (l_min_x <= center.x() <= l_max_x and l_min_y <= center.y() <= l_max_y):
-                if blank_safe.contains(center) and not danger_zone.contains(center):
-                    points.append({"x": round(float(center.x()), 3), "y": round(float(center.y()), 3)})
+                    in_hole = False
+                    for hx, hy, hr in hole_exclusion_areas:
+                        if math.hypot(x - hx, y - hy) <= hr:
+                            in_hole = True
+                            break
+                    if not in_hole:
+                        points.append({"x": round(float(x), 3), "y": round(float(y), 3)})
         return points
 
-    def _on_run_probing_clicked(self) -> None:
-        if not self.placed_pcbs:
-            self.log_human(False, "Ошибка: Сперва разместите плату!")
-            return
-
-        msg_box = QMessageBox(self)
-        msg_box.setIcon(QMessageBox.Question)
-        msg_box.setWindowTitle("Проверка")
-        msg_box.setText("Подтвердите, что крокодилы надежно прикреплены к шпинделю и плате.")
-        btn_yes = msg_box.addButton("✅ Подтверждаю, начать", QMessageBox.AcceptRole)
-        msg_box.addButton("❌ Отмена", QMessageBox.RejectRole)
-        msg_box.exec_()
+    def _generate_probe_points(self) -> list[dict]:
+        if not self.placed_pcbs: return []
+        placed = self.placed_pcbs[-1]
+        scale = self._get_scale()
+        cx, cy = self._get_center_px()
         
-        if msg_box.clickedButton() != btn_yes:
-            logger.info("❌ Пробинг отменен пользователем.")
+        # Для тестовой визуализации сетки пробинга в UI не вырезаем отверстия
+        return self._generate_mill_probe_points(placed['pos'], placed['angle'], scale, cx, cy, {})
+
+    def _map_px_to_physical(self, px, py, pcb_pos, pcb_angle, scale, cx, cy):
+        rad = math.radians(pcb_angle)
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+        rel_x = (px - cx) * scale
+        rel_y = -(py - cy) * scale
+        rx = rel_x * cos_a - rel_y * sin_a
+        ry = rel_x * sin_a + rel_y * cos_a
+        return pcb_pos.x() + rx, pcb_pos.y() + ry
+
+    # ================= ИЗГОТОВЛЕНИЕ ПЛАТЫ (FABRICATION WORKFLOW) =================
+    def _start_fabrication_workflow(self):
+        if not self.placed_pcbs or not self._last_result:
+            self.log_human(False, "Плата не размещена!")
             return
-
-        def do_probing():
-            points = self._generate_probe_points()
-            if not points:
-                self.log_human(False, "Не найдено безопасных точек для пробинга! Плата вне Blank или близко к Danger.")
-                return
-
-            ip = self.resolve_server_ip()
-            if not ip: return
-
-            payload = {"points": points, "V_MAX": float(self.cut_speed_steps_s.value()), "A_MAX": float(self.max_accel_steps_s2.value())}
-            self.btn_run_probing.setEnabled(False)
             
+        def start():
+            self.btn_fabricate.setEnabled(False)
+            self._fab_plan = []
+            
+            pcb_pos = self.placed_pcbs[0]['pos']
+            pcb_angle = self.placed_pcbs[0]['angle']
+            scale = self._get_scale()
+            cx, cy = self._get_center_px()
+            
+            # Группировка отверстий по диаметру
+            holes = self._last_result.holes
+            drill_groups = {}
+            for h in holes:
+                d_mm = round((h.radius_px * 2 * scale), 2)
+                drill_groups.setdefault(d_mm, []).append(h)
+                
+            sorted_diams = sorted(drill_groups.keys())
+            
+            # 1. Добавление этапов сверления под каждый диаметр
+            for diam in sorted_diams:
+                pts_px = [(h.x_px, h.y_px) for h in drill_groups[diam]]
+                pts_mm = []
+                for px, py in pts_px:
+                    mx, my = self._map_px_to_physical(px, py, pcb_pos, pcb_angle, scale, cx, cy)
+                    pts_mm.append({'x': round(mx, 3), 'y': round(my, 3)})
+                    
+                self._fab_plan.append(lambda d=diam, pts=pts_mm: self._fab_drill_phase(d, pts))
+                
+            # 2. Добавление этапа фрезеровки дорожек и контуров
+            self._fab_plan.append(lambda: self._fab_mill_phase(pcb_pos, pcb_angle, scale, cx, cy, drill_groups))
+            self._next_fab_step()
+            
+        self._check_homing_and_execute(start)
+
+    def _next_fab_step(self):
+        if not getattr(self, '_fab_plan', []):
+            self._safe_travel(0.0, 0.0)
+            self.log_human(True, "🎉 ПРОЦЕСС ИЗГОТОВЛЕНИЯ ПОЛНОСТЬЮ ЗАВЕРШЕН!")
+            self.btn_fabricate.setEnabled(True)
+            return
+        step_func = self._fab_plan.pop(0)
+        step_func()
+
+    def _safe_travel(self, x, y, on_success=None):
+        """Безопасный переезд с предварительным подъемом по Z"""
+        ip = self.resolve_server_ip()
+        worker1 = ApiWorker(f"http://{ip}:8000/api/v0/move_absolute", "POST", {"z": 0.0, "diagonal": True})
+        worker1.failed.connect(lambda e: self.log_human(False, f"Ошибка подъема Z: {e}"))
+        
+        def move_xy():
+            worker2 = ApiWorker(f"http://{ip}:8000/api/v0/move_absolute", "POST", {"x": x, "y": y, "diagonal": True})
+            if on_success: worker2.success.connect(lambda _: on_success())
+            worker2.failed.connect(lambda e: self.log_human(False, f"Ошибка переезда XY: {e}"))
+            self._track_worker(worker2)
+            
+        worker1.success.connect(lambda _: move_xy())
+        self._track_worker(worker1)
+
+    def _prompt_user(self, title, text, on_yes):
+        msg = QMessageBox(self)
+        msg.setWindowTitle(title)
+        msg.setText(text)
+        msg.setIcon(QMessageBox.Information)
+        btn_ok = msg.addButton("✅ Выполнено", QMessageBox.AcceptRole)
+        btn_cancel = msg.addButton("❌ Отмена", QMessageBox.RejectRole)
+        msg.exec_()
+        if msg.clickedButton() == btn_ok: on_yes()
+        else:
+            self.log_human(False, "Процесс прерван пользователем.")
+            self.btn_fabricate.setEnabled(True)
+
+    def _fab_drill_phase(self, diam_mm, points_mm):
+        self.log_human(True, f"Этап сверления: диаметр {diam_mm} мм")
+        def step2():
+            self._prompt_user("Смена инструмента", f"Установите СВЕРЛО {diam_mm} мм.\nПодключите крокодил автоуровня.", step3)
+        def step3():
+            self.log_human(True, f"Снятие карты высот для отверстий ({len(points_mm)} точек)...")
+            ip = self.resolve_server_ip()
+            payload = {"points": points_mm, "V_MAX": float(self.cut_speed_steps_s.value()), "A_MAX": float(self.max_accel_steps_s2.value())}
             worker = ApiWorker(f"http://{ip}:8000/api/v0/z_probe", "POST", payload, timeout=None)
-            worker.success.connect(self._on_probing_success)
+            worker.success.connect(step4)
             worker.failed.connect(lambda e: self.log_human(False, f"Ошибка Z-пробинга: {e}"))
-            worker.success.connect(lambda: self._api_get_coords(silent=True))
-            worker.failed.connect(lambda: self._api_get_coords(silent=True))
-            worker.failed.connect(lambda e: self.btn_run_probing.setEnabled(True))
+            self._track_worker(worker)
+        def step4(data):
+            probed_pts = data.get("points", [])
+            self._current_drill_z_map = { (p['x'], p['y']): p['z'] for p in probed_pts }
+            self._safe_travel(0, 20, step5)
+        def step5():
+            self._prompt_user("Запуск обработки", "ВНИМАНИЕ: Снимите крокодил автоуровня!\nНачать сверление?", step6)
+        def step6():
+            gc = GCodeBuilder(feedrate=float(self.cut_speed_steps_s.value()))
+            gc.motor_on()
+            for p in points_mm:
+                x, y = p['x'], p['y']
+                z_surface = self._current_drill_z_map.get((x, y), 0.0)
+                safe_z = z_surface - 2.0  
+                target_z = z_surface + float(self.stock_thickness_mm.value()) + 0.5 
+                
+                gc.rapid(z=0)
+                gc.rapid(x=x, y=y)
+                gc.rapid(z=safe_z)
+                gc.feed(z=target_z, f=60.0)
+                gc.rapid(z=0)
+                
+            gc.motor_off()
+            ip = self.resolve_server_ip()
+            payload = {"commands": gc.lines, "V_MAX": float(self.cut_speed_steps_s.value()), "A_MAX": float(self.max_accel_steps_s2.value())}
+            worker = ApiWorker(f"http://{ip}:8000/api/v0/run_gcode", "POST", payload, timeout=None)
+            worker.success.connect(lambda _: self._next_fab_step())
+            worker.failed.connect(lambda e: self.log_human(False, f"Ошибка сверления: {e}"))
+            self._track_worker(worker)
+            
+        self._safe_travel(0, 20, step2)
+
+    def _fab_mill_phase(self, pos, angle, scale, cx, cy, drill_groups):
+        self.log_human(True, "Этап фрезеровки контуров и проводников")
+        def step2():
+            self._prompt_user("Смена инструмента", "Установите ГРАВЕР/ФРЕЗУ.\nПодключите крокодил автоуровня.", step3)
+        def step3():
+            probe_pts = self._generate_mill_probe_points(pos, angle, scale, cx, cy, drill_groups)
+            if not probe_pts:
+                self.log_human(False, "Не сгенерированы точки пробинга.")
+                return
+            
+            ip = self.resolve_server_ip()
+            payload = {"points": probe_pts, "V_MAX": float(self.cut_speed_steps_s.value()), "A_MAX": float(self.max_accel_steps_s2.value())}
+            worker = ApiWorker(f"http://{ip}:8000/api/v0/z_probe", "POST", payload, timeout=None)
+            worker.success.connect(step4)
+            worker.failed.connect(lambda e: self.log_human(False, f"Ошибка Z-пробинга: {e}"))
+            self._track_worker(worker)
+        def step4(data):
+            pts = data.get("points", [])
+            self.tabs.setCurrentWidget(self.spline_tab)
+            self.spline_widget.plot_points(pts)
+            
+            arr_pts = np.array([[p['x'], p['y']] for p in pts])
+            arr_zs = np.array([p['z'] for p in pts])
+            lin = LinearNDInterpolator(arr_pts, arr_zs)
+            near = NearestNDInterpolator(arr_pts, arr_zs)
+            def get_z(x, y):
+                z = lin(x, y)
+                if np.isnan(z): z = near(x, y)
+                return float(z)
+            self._z_interpolator = get_z
+            self._safe_travel(0, 20, step5)
+            
+        def step5():
+            self._prompt_user("Запуск фрезеровки", "ВНИМАНИЕ: Снимите крокодил автоуровня!\nНачать фрезеровку?", step6)
+            
+        def step6():
+            self.log_human(True, "Экспорт векторных путей в G-код и запуск фрезеровки...")
+            gc = GCodeBuilder(feedrate=float(self.cut_speed_steps_s.value()))
+            gc.motor_on()
+            
+            def add_paths(paths_px, depth):
+                for poly in paths_px:
+                    if len(poly) < 2: continue
+                    mx, my = self._map_px_to_physical(poly[0][0], poly[0][1], pos, angle, scale, cx, cy)
+                    z_surf = self._z_interpolator(mx, my)
+                    gc.rapid(z=0)
+                    gc.rapid(x=mx, y=my)
+                    gc.feed(z=z_surf + depth, f=100.0) 
+                    
+                    for px, py in poly[1:]:
+                        nx, ny = self._map_px_to_physical(px, py, pos, angle, scale, cx, cy)
+                        nz_surf = self._z_interpolator(nx, ny)
+                        gc.feed(x=nx, y=ny, z=nz_surf + depth, f=float(self.cut_speed_steps_s.value()))
+                    gc.rapid(z=0)
+
+            # 1. Изоляция дорожек (Black)
+            depth_traces = float(self.trace_depth_mm.value()) * 1.01
+            add_paths(self._last_result.black_paths, depth_traces)
+            
+            # 2. Текст / маркировка (Green)
+            depth_silk = float(self.green_depth_mm.value())
+            add_paths(self._last_result.green_paths, depth_silk)
+            
+            # 3. Обрезка контура (Red) с распределением по слоям заглубления
+            stock = float(self.stock_thickness_mm.value())
+            max_pass = float(self.trace_depth_mm.value()) * 1.25
+            passes = math.ceil(stock / max_pass)
+            pass_depths = [(i + 1) * (stock / passes) for i in range(passes)]
+            
+            for depth_cut in pass_depths:
+                add_paths(self._last_result.cut_paths, depth_cut)
+                
+            gc.motor_off()
+            ip = self.resolve_server_ip()
+            payload = {"commands": gc.lines, "V_MAX": float(self.cut_speed_steps_s.value()), "A_MAX": float(self.max_accel_steps_s2.value())}
+            worker = ApiWorker(f"http://{ip}:8000/api/v0/run_gcode", "POST", payload, timeout=None)
+            worker.success.connect(lambda _: self._next_fab_step())
+            worker.failed.connect(lambda e: self.log_human(False, f"Ошибка фрезеровки: {e}"))
             self._track_worker(worker)
 
-        self._check_homing_and_execute(do_probing)
-
-    def _on_probing_success(self, data):
-        self.btn_run_probing.setEnabled(True)
-        points = data.get("points", [])
-        if not points:
-            self.log_human(False, "Станок вернул пустой список точек после пробинга.")
-            return
-
-        self.tabs.setCurrentWidget(self.spline_tab)
-        self.spline_widget.plot_points(points)
-        self.log_human(True, f"Успешно снята карта высот ({len(points)} точек).")
+        self._safe_travel(0, 20, step2)
 
     def _init_layer_list(self) -> None:
         self.layer_list.clear()

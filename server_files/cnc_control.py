@@ -27,8 +27,13 @@ class CNCMachine:
         self.z_probe_v_max = None
         self.z_probe_a_max = None
         
-        self.motor_is_on = False      # Текущее состояние (Вкл/Выкл)
-        self.saved_motor_state = False # Сохраненное состояние для Pause/Resume
+        self.motor_is_on = False      
+        self.saved_motor_state = False 
+
+        # Для G-кода
+        self.gcode_commands = []
+        self.gcode_index = 0
+        self.current_feedrate = 600.0 # Скорость по умолчанию (мм/мин)
         
     def _endstop_callback(self, pin):
         """Фоновый обработчик прерывания от процессора"""
@@ -693,3 +698,73 @@ class CNCMachine:
         """Восстанавливает работу мотора после снятия с паузы"""
         self.motor_is_on = self.saved_motor_state
         GPIO.output(M_MOTOR, GPIO.HIGH if self.motor_is_on else GPIO.LOW)
+
+    # ================= ИСПОЛНЕНИЕ G-CODE =================
+    def run_gcode(self, commands, v_max=None, a_max=None, is_resume=False):
+        if self.pause: raise RuntimeError("Сперва выполните resume")
+        if not self.is_homed: raise RuntimeError("Сперва выполните паркинг")
+
+        if not is_resume:
+            self.gcode_commands = commands
+            self.gcode_index = 0
+            self.current_feedrate = 600.0
+
+        self.active_operation = 'gcode'
+        v_rapid = v_max if v_max is not None else V_MAX
+        a_limit = a_max if a_max is not None else A_MAX
+
+        try:
+            while self.gcode_index < len(self.gcode_commands):
+                if self.pause: raise RuntimeError("G-code paused")
+                
+                line = self.gcode_commands[self.gcode_index].strip().upper()
+                self.gcode_index += 1
+                
+                if not line or line.startswith(';') or line.startswith('('):
+                    continue
+
+                parts = line.split()
+                cmd = parts[0]
+                args = {p[0]: float(p[1:]) for p in parts[1:] if p[0] in 'XYZF'}
+
+                if 'F' in args:
+                    self.current_feedrate = args['F']
+
+                if cmd == 'G0':
+                    x = args.get('X')
+                    y = args.get('Y')
+                    z = args.get('Z')
+                    if x is not None or y is not None or z is not None:
+                        self.move_absolute(x=x, y=y, z=z, diagonal=True, v_max=v_rapid, a_max=a_limit)
+
+                elif cmd == 'G1':
+                    x = args.get('X')
+                    y = args.get('Y')
+                    z = args.get('Z')
+                    if x is not None or y is not None or z is not None:
+                        moving_axes = []
+                        if x is not None and abs(x - self.pos['X']/self.spm['X']) > 0.001: moving_axes.append('X')
+                        if y is not None and abs(y - self.pos['Y']/self.spm['Y']) > 0.001: moving_axes.append('Y')
+                        if z is not None and abs(z - self.pos['Z']/self.spm['Z']) > 0.001: moving_axes.append('Z')
+
+                        if moving_axes:
+                            max_spm = max(self.spm[ax] for ax in moving_axes)
+                            v_feed = (self.current_feedrate / 60.0) * max_spm
+                            v_feed = min(v_feed, v_rapid)
+                            v_feed = max(v_feed, V_MIN)
+                            self.move_absolute(x=x, y=y, z=z, diagonal=True, v_max=v_feed, a_max=a_limit)
+
+                elif cmd == 'M3':
+                    self.set_motor_state(True)
+                elif cmd == 'M5':
+                    self.set_motor_state(False)
+
+        except Exception:
+            if self.pause:
+                self.interrupted_operation = 'gcode'
+                if self.gcode_index > 0:
+                    self.gcode_index -= 1
+            raise
+        finally:
+            if not self.pause:
+                self.active_operation = None
