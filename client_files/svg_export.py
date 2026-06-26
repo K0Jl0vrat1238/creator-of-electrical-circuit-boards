@@ -33,6 +33,7 @@ def export_yaml_config(config: PipelineConfig, result: PipelineResult, path: Pat
         "gcode_generation": {
             "stock_thickness_mm": config.stock_thickness_mm,
             "cut_speed_mm_s": config.cut_speed_mm_s,
+            "plunge_speed_steps_s": config.plunge_speed_steps_s,
             "max_accel_mm_s2": config.max_accel_mm_s2,
             "trace_depth_mm": config.trace_depth_mm,
             "green_depth_mm": config.green_depth_mm

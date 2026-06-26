@@ -52,6 +52,36 @@ class GCodeBuilder:
         if f is not None: parts.append(f"F{f}")
         if len(parts) > 1: self.lines.append(" ".join(parts))
 
+def _generate_plunge_gcode(gc: GCodeBuilder, start_z: float, target_z: float, z_surf: float, copper_thickness: float, plunge_f: float, cut_f: float) -> None:
+    """
+    Разбивает траекторию опускания оси Z на 3 сегмента:
+    1. Быстрый подвод (G0) до точки (z_surf - 0.5 мм).
+    2. Погружение через медь на скорости plunge_f до точки (z_surf + copper_thickness).
+    3. Достижение финальной точки на скорости резания cut_f.
+    """
+    if target_z <= start_z:
+        gc.rapid(z=target_z)
+        return
+
+    zone_start = z_surf - 0.5
+    zone_end = z_surf + copper_thickness
+
+    # Сегмент 1: Быстрый подвод до начала зоны медного слоя
+    if start_z < zone_start:
+        boundary = min(target_z, zone_start)
+        gc.rapid(z=boundary)
+        start_z = boundary
+
+    # Сегмент 2: Проход медного слоя с заданной скоростью погружения Z
+    if target_z > start_z and start_z < zone_end:
+        boundary = min(target_z, zone_end)
+        gc.feed(z=boundary, f=plunge_f)
+        start_z = boundary
+
+    # Сегмент 3: Движение на рабочей подаче резания ниже меди
+    if target_z > start_z:
+        gc.feed(z=target_z, f=cut_f)
+
 class MainWindow(QMainWindow):
     def __init__(self, skip_validation: bool = False) -> None:
         super().__init__()
@@ -1216,6 +1246,11 @@ class MainWindow(QMainWindow):
         def step6():
             gc = GCodeBuilder(feedrate=float(self.cut_speed_steps_s.value()))
             gc.motor_on()
+            
+            copper_thickness = float(self.trace_depth_mm.value())
+            plunge_f = (float(self.plunge_speed_steps_s.value()) / 800) * 60.0
+            cut_f = float(self.cut_speed_steps_s.value() / 800) * 60.0
+            
             for p in points_mm:
                 x, y = p['x'], p['y']
                 z_surface = self._current_drill_z_map.get((x, y), 0.0)
@@ -1224,8 +1259,8 @@ class MainWindow(QMainWindow):
                 
                 gc.rapid(z=0)
                 gc.rapid(x=x, y=y)
-                gc.rapid(z=safe_z)
-                gc.feed(z=target_z, f=60.0)
+                # Применить новое раздельное опускание Z
+                _generate_plunge_gcode(gc, 0.0, target_z, z_surface, copper_thickness, plunge_f, cut_f)
                 gc.rapid(z=0)
                 
             gc.motor_off()
@@ -1278,6 +1313,10 @@ class MainWindow(QMainWindow):
             gc = GCodeBuilder(feedrate=float(self.cut_speed_steps_s.value()))
             gc.motor_on()
             
+            copper_thickness = float(self.trace_depth_mm.value())
+            plunge_f = (float(self.plunge_speed_steps_s.value()) / 800) * 60.0
+            cut_f = float(self.cut_speed_steps_s.value() / 800) * 60.0
+            
             def add_paths(paths_px, depth):
                 for poly in paths_px:
                     if len(poly) < 2: continue
@@ -1285,7 +1324,10 @@ class MainWindow(QMainWindow):
                     z_surf = self._z_interpolator(mx, my)
                     gc.rapid(z=0)
                     gc.rapid(x=mx, y=my)
-                    gc.feed(z=z_surf + depth, f=100.0) 
+                    
+                    target_z = z_surf + depth
+                    # Применить новое раздельное опускание Z
+                    _generate_plunge_gcode(gc, 0.0, target_z, z_surf, copper_thickness, plunge_f, cut_f)
                     
                     for px, py in poly[1:]:
                         nx, ny = self._map_px_to_physical(px, py, pos, angle, scale, cx, cy)
@@ -1450,6 +1492,7 @@ class MainWindow(QMainWindow):
         
         self.stock_thickness_mm = self._spin(0.001, 1000.0, 1.5, suffix=" мм")
         self.cut_speed_steps_s = self._spin(0.001, 100000.0, 15000.0, suffix=" шаг/с", decimals=0)
+        self.plunge_speed_steps_s = self._spin(0.001, 100000.0, 1500.0, suffix=" шаг/с", decimals=0)
         self.max_accel_steps_s2 = self._spin(0.001, 1000000.0, 10000.0, suffix=" шаг/с²", decimals=0)
         
         self.trace_depth_mm = self._spin(0.001, 1000.0, 0.2, suffix=" мм")
@@ -1468,6 +1511,7 @@ class MainWindow(QMainWindow):
         
         form.addRow("Толщина заготовки:", self.stock_thickness_mm)
         form.addRow("Скорость реза:", self.cut_speed_steps_s)
+        form.addRow("Скорость погружения Z:", self.plunge_speed_steps_s)
         form.addRow("Ускорение:", self.max_accel_steps_s2)
         form.addRow("Толщина меди:", self.trace_depth_mm)
         form.addRow("Глубина гравировки:", self.green_depth_mm)
@@ -1544,6 +1588,9 @@ class MainWindow(QMainWindow):
             for i, val in enumerate(config.drill_diameters_mm):
                 if i < len(self.drill_spins):
                     self.drill_spins[i].setValue(val)
+            
+            if hasattr(config, 'plunge_speed_steps_s'):
+                self.plunge_speed_steps_s.setValue(config.plunge_speed_steps_s)
         except Exception: pass
 
     def _build_config(self) -> PipelineConfig:
@@ -1560,7 +1607,8 @@ class MainWindow(QMainWindow):
             drill_diameters_mm=diams,
             stepover_percent=float(self.stepover_percent.value()), simplify_tolerance_mm=float(self.simplify_tolerance_mm.value()),
             green_mode=mode, stock_thickness_mm=float(self.stock_thickness_mm.value()),
-            cut_speed_mm_s=float(self.cut_speed_steps_s.value()), max_accel_mm_s2=float(self.max_accel_steps_s2.value()),
+            cut_speed_mm_s=float(self.cut_speed_steps_s.value()), plunge_speed_steps_s=float(self.plunge_speed_steps_s.value()),
+            max_accel_mm_s2=float(self.max_accel_steps_s2.value()),
             trace_depth_mm=float(self.trace_depth_mm.value()), green_depth_mm=float(self.green_depth_mm.value()),
             skip_validation=self._initial_skip_validation
         )

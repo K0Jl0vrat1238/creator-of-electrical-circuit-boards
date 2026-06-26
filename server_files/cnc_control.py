@@ -184,12 +184,18 @@ class CNCMachine:
         max_speed = v_max if v_max is not None else V_MAX
         accel = a_max if a_max is not None else A_MAX
         
-        s_accel = int((max_speed**2 - V_MIN**2) / (2 * accel))
-        if s_accel > steps / 2:
-            s_accel = steps // 2
-            
-        s_decel = steps - s_accel
-        v_current = V_MIN
+        if max_speed <= V_MIN:
+            # Если целевая скорость ниже минимальной стартовой, 
+            # едем на константной медленной скорости без разгона/торможения
+            s_accel = 0
+            s_decel = steps
+            v_current = max_speed
+        else:
+            s_accel = int((max_speed**2 - V_MIN**2) / (2 * accel))
+            if s_accel > steps / 2:
+                s_accel = steps // 2
+            s_decel = steps - s_accel
+            v_current = V_MIN
         
         actual_steps = 0
         
@@ -386,12 +392,16 @@ class CNCMachine:
         # Настройка профиля скорости по ведущей оси
         max_speed = v_max if v_max is not None else V_MAX
         accel = a_max if a_max is not None else A_MAX
-        s_accel = int((max_speed**2 - V_MIN**2) / (2 * accel))
-        if s_accel > max_delta / 2:
-            s_accel = max_delta // 2
-            
-        s_decel = max_delta - s_accel
-        v_current = V_MIN
+        if max_speed <= V_MIN:
+            s_accel = 0
+            s_decel = max_delta
+            v_current = max_speed
+        else:
+            s_accel = int((max_speed**2 - V_MIN**2) / (2 * accel))
+            if s_accel > max_delta / 2:
+                s_accel = max_delta // 2
+            s_decel = max_delta - s_accel
+            v_current = V_MIN
 
         for i in range(max_delta):
             if self.pause:
@@ -750,8 +760,10 @@ class CNCMachine:
                         if moving_axes:
                             max_spm = max(self.spm[ax] for ax in moving_axes)
                             v_feed = (self.current_feedrate / 60.0) * max_spm
-                            v_feed = min(v_feed, v_rapid)
-                            v_feed = max(v_feed, V_MIN)
+                            if v_feed < V_MIN:
+                                v_feed = min(v_feed, v_rapid) # Защита от нулевой скорости
+                            else:
+                                v_feed = max(v_feed, V_MIN) 
                             self.move_absolute(x=x, y=y, z=z, diagonal=True, v_max=v_feed, a_max=a_limit)
 
                 elif cmd == 'M3':
