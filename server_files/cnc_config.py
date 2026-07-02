@@ -19,12 +19,13 @@ AXES_CONFIG = {
         'steps_per_mm': Z_STEPS_MM, 'final_offset_mm': 2.0  # Отъезд 2 мм
     },
     'X': {
-        'step': 3, 'dir': 5, 'en': 7, 'endstop': 22, 
+        'step': 3, 'dir': 
+            5, 'en': 7, 'endstop': 22, 
         'steps_per_mm': X_STEPS_MM, 'final_offset_mm': 2.0  # Отъезд 2 мм
     },
     'Y': {
         'step': 11, 'dir': 13, 'en': 15, 'endstop': 24, 
-        'steps_per_mm': Y_STEPS_MM, 'final_offset_mm': 162.0 # Отъезд 92 мм
+        'steps_per_mm': Y_STEPS_MM, 'final_offset_mm': 162.0 # Отъезд 162 мм
     }
 }
 
@@ -33,7 +34,8 @@ RED_CRAB = 16
 
 # Запретные зоны (софтверные лимиты в мм)
 MIN_X, MAX_X = 0.0, 260.0
-MIN_Y, MAX_Y = -160.0, 20.0
+
+
 MIN_Z, MAX_Z = 0.0, 30.0
 
 # Количество подходов для усреднения точности
@@ -54,3 +56,15 @@ V_SLOW_HOME = 10000.0  # Максимальная скорость для точ
 
 # Шайтан-мотор
 M_MOTOR = 35
+
+# Свет
+# LED_PIN = 29
+
+# Тормоза
+# BRAKE_PIN_Z = 23
+# BRAKE_PIN_Y = 21
+# BRAKE_PIN_X = 19
+
+# Стоп кнопка
+# STOP_BUTTON_PIN = 31
+
