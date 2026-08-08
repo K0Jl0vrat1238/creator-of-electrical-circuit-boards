@@ -28,7 +28,12 @@ class CNCMachine:
         self.z_probe_a_max = None
         
         self.motor_is_on = False      
-        self.saved_motor_state = False 
+        self.saved_motor_state = False
+
+        # Добавляем состояние света
+        self.light_is_on = False
+
+        self.sleep_mode = True # По умолчанию при запуске станок в спячке (на тормозах)
 
         # Для G-кода
         self.gcode_commands = []
@@ -90,7 +95,8 @@ class CNCMachine:
             GPIO.add_event_detect(cfg['endstop'], GPIO.FALLING, callback=self._endstop_callback, bouncetime=50)
             
             GPIO.setup([cfg['step'], cfg['dir'], cfg['en']], GPIO.OUT)
-            GPIO.output(cfg['en'], GPIO.LOW) 
+
+            GPIO.output(cfg['en'], GPIO.HIGH) 
 
         # ИЗМЕНЕНИЕ: Меняем PUD_UP на PUD_DOWN, так как в воздухе у нас LOW
         GPIO.setup(RED_CRAB, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
@@ -105,19 +111,34 @@ class CNCMachine:
         
         # Выключаем пин аппаратно
         try:
-            GPIO.setup(M_MOTOR, GPIO.OUT)
-            GPIO.output(M_MOTOR, GPIO.LOW)
+            GPIO.setup(M_MOTOR, GPIO.OUT, initial=GPIO.HIGH)
         except Exception:
             pass
         
     def shutdown(self):
-        """Обесточивание обмоток моторов без риска Segmentation fault"""
-        # Если режим еще не задан (сервер только включился) - задаем его
+        """Мгновенное аппаратное обесточивание и торможение (Аварийный стоп)"""
         if GPIO.getmode() is None:
             GPIO.setmode(GPIO.BOARD)
             GPIO.setwarnings(False)
-            
-        # Настраиваем ТОЛЬКО пины EN на выход и сразу рубим питание моторов
+
+        # 1. МГНОВЕННО ГАСИМ ШПИНДЕЛЬ
+        try:
+            GPIO.setup(M_MOTOR, GPIO.OUT, initial=GPIO.HIGH)
+            GPIO.output(M_MOTOR, GPIO.HIGH)
+        except Exception:
+            pass
+
+        # 2. МГНОВЕННО БЬЕМ ПО ТОРМОЗАМ (без всяких time.sleep)
+        for ax in ['X', 'Y', 'Z']:
+            pin = BRAKE_PINS.get(ax)
+            if pin:
+                try:
+                    GPIO.setup(pin, GPIO.OUT)
+                    GPIO.output(pin, GPIO.HIGH)
+                except Exception:
+                    pass
+
+        # 3. МГНОВЕННО ОБЕСТОЧИВАЕМ ДРАЙВЕРА
         for axis in ['X', 'Y', 'Z']:
             if axis in AXES_CONFIG:
                 en_pin = AXES_CONFIG[axis]['en']
@@ -127,7 +148,7 @@ class CNCMachine:
                 except Exception:
                     pass
 
-        # Безопасно отписываемся от прерываний (если они были запущены)
+        # 4. Безопасно отписываемся от прерываний концевиков
         for axis in ['X', 'Y', 'Z']:
             if axis in AXES_CONFIG:
                 try:
@@ -139,16 +160,106 @@ class CNCMachine:
         except Exception:
             pass
 
-        # Выключаем пин аппаратно
+        # 5. ОЧИЩАЕМ ПАМЯТЬ ВЫБОРОЧНО (ЗАЩИТА ОТ ПАДЕНИЯ ОСИ Z)
+        # Мы НЕ чистим пины тормозов, света и E-STOP, чтобы они сохранили свое состояние!
+        pins_to_clean = [RED_CRAB, M_MOTOR]
+        for ax in ['X', 'Y', 'Z']:
+            if ax in AXES_CONFIG:
+                cfg = AXES_CONFIG[ax]
+                pins_to_clean.extend([cfg['step'], cfg['dir'], cfg['en'], cfg['endstop']])
+                
         try:
-            GPIO.setup(M_MOTOR, GPIO.OUT)
-            GPIO.output(M_MOTOR, GPIO.LOW)
+            GPIO.cleanup(pins_to_clean)
         except Exception:
             pass
 
-        # Очищаем память
-        GPIO.cleanup()
+    def emergency_stop(self):
+        """Полная экстренная остановка всего станка. Вызывается по кнопке или API."""
+        logger.warning("АВАРИЙНЫЙ СТОП! Остановка всех систем!")
+        self.pause = True
+        self.is_homed = False
+        self.z_probe_active = False
+        self.active_operation = None
+        self.interrupted_operation = None
+        self.resume_target = None
+        
+        # Сбрасываем мотор логически
+        self.motor_is_on = False
+        self.saved_motor_state = False
+        
+        # Очищаем кэш пробинга
+        self.remaining_z_probe_points = []
+        self.z_probe_results = []
+        self.first_touch_z = None
+        
+        # Очищаем G-код
+        self.gcode_commands = []
+        self.gcode_index = 0
+        
+        # Вызываем аппаратное обесточивание
+        self.shutdown()
 
+    def _estop_callback(self, pin):
+        """Аппаратное прерывание от физической кнопки E-Stop (с защитой от наводок)"""
+        if GPIO.getmode() is None:
+            return
+            
+        # Пропускаем фронт возможной высокочастотной помехи
+        time.sleep(0.002) 
+        
+        try:
+            low_count = 0
+            num_reads = 500  # Делаем 500 замеров
+            
+            # Читаем пин пулеметом
+            for _ in range(num_reads):
+                if GPIO.input(pin) == GPIO.LOW:
+                    low_count += 1
+            
+            # Голосование: если состояние LOW было зафиксировано больше чем в половине случаев
+            if low_count > (num_reads / 2):
+                # Это точно не помеха, глушим станок!
+                self.emergency_stop()
+                
+        except RuntimeError:
+            pass
+
+    def is_estop_pressed(self) -> bool:
+        """Возвращает True, если E-Stop кнопка зажата (с защитой от ложных срабатываний)"""
+        if GPIO.getmode() is None:
+            return False
+        try:
+            low_count = 0
+            num_reads = 500
+            
+            for _ in range(num_reads):
+                if GPIO.input(STOP_BUTTON_PIN) == GPIO.LOW:
+                    low_count += 1
+                    
+            # Возвращаем True только если кнопка уверенно и стабильно прижата к земле
+            return low_count > (num_reads / 2)
+        except Exception:
+            return False
+
+    def init_global_hardware(self):
+        """Инициализация глобальных пинов (Стоп-кнопка) при старте сервера"""
+        if GPIO.getmode() is None:
+            GPIO.setmode(GPIO.BOARD)
+            GPIO.setwarnings(False)
+            
+        # Настройка E-STOP (подтяжка 3.3v аппаратная, поэтому pull_up_down не нужен)
+        try:
+            GPIO.setup(STOP_BUTTON_PIN, GPIO.IN)
+            GPIO.remove_event_detect(STOP_BUTTON_PIN)
+        except Exception:
+            pass
+            
+        # Ловим перепад из HIGH в LOW (момент нажатия)
+        GPIO.add_event_detect(STOP_BUTTON_PIN, GPIO.FALLING, callback=self._estop_callback, bouncetime=200)
+
+        # При старте сервера уводим моторы в сон (зажимаем тормоза)
+        self.sleep_steppers(['X', 'Y', 'Z'])
+            
     def step(self, axis, direction, delay):
         if self.pause:
             return False
@@ -315,6 +426,9 @@ class CNCMachine:
         self.set_motor_state(False)
         self.saved_motor_state = False
         self.setup()
+
+        self.wake_up_steppers(['X', 'Y', 'Z'])
+        self.sleep_mode = False
         
         good = True
     
@@ -697,17 +811,87 @@ class CNCMachine:
             self.saved_motor_state = self.motor_is_on
             return
             
-        GPIO.output(M_MOTOR, GPIO.HIGH if self.motor_is_on else GPIO.LOW)
+        GPIO.output(M_MOTOR, GPIO.LOW if self.motor_is_on else GPIO.HIGH)
 
     def pause_motor(self):
         """Сохраняет состояние и выключает мотор при паузе"""
         self.saved_motor_state = self.motor_is_on
-        GPIO.output(M_MOTOR, GPIO.LOW)
+        GPIO.output(M_MOTOR, GPIO.HIGH) # HIGH - это ВЫКЛ
 
     def resume_motor(self):
         """Восстанавливает работу мотора после снятия с паузы"""
         self.motor_is_on = self.saved_motor_state
-        GPIO.output(M_MOTOR, GPIO.HIGH if self.motor_is_on else GPIO.LOW)
+        # Инвертированная логика
+        GPIO.output(M_MOTOR, GPIO.LOW if self.motor_is_on else GPIO.HIGH)
+
+    def set_light_state(self, is_on: bool):
+        """Управление подсветкой (LOW - включена, HIGH - выключена)"""
+        if GPIO.getmode() is None:
+            GPIO.setmode(GPIO.BOARD)
+            GPIO.setwarnings(False)
+            
+        self.light_is_on = bool(is_on)
+        try:
+            GPIO.setup(LED_PIN, GPIO.OUT)
+            GPIO.output(LED_PIN, GPIO.LOW if self.light_is_on else GPIO.HIGH)
+            logger.info(f"Подсветка {'включена' if self.light_is_on else 'выключена'}")
+        except Exception as e:
+            logger.error(f"Ошибка управления светом: {e}")
+
+    def set_brakes(self, axes, engage: bool):
+        """Управление тормозами для списка осей или одной оси."""
+        if isinstance(axes, str):
+            axes = [axes]
+            
+        if GPIO.getmode() is None:
+            GPIO.setmode(GPIO.BOARD)
+            GPIO.setwarnings(False)
+            
+        for ax in axes:
+            pin = BRAKE_PINS.get(ax)
+            if pin:
+                try:
+                    GPIO.setup(pin, GPIO.OUT)
+                    GPIO.output(pin, GPIO.HIGH if engage else GPIO.LOW)
+                except Exception as e:
+                    logger.error(f"Ошибка тормоза оси {ax}: {e}")
+
+    def wake_up_steppers(self, axes=['X', 'Y', 'Z']):
+        """Вывод из сна: подаем ток удержания -> ждем -> отпускаем тормоза -> ждем реле"""
+        if isinstance(axes, str): axes = [axes]
+        if GPIO.getmode() is None: GPIO.setmode(GPIO.BOARD)
+            
+        # 1. Подаем ток на драйвера (LOW = ВКЛ)
+        for ax in axes:
+            if ax in AXES_CONFIG:
+                try:
+                    GPIO.setup(AXES_CONFIG[ax]['en'], GPIO.OUT)
+                    GPIO.output(AXES_CONFIG[ax]['en'], GPIO.LOW)
+                except Exception:
+                    pass
+                    
+        time.sleep(0.1) # Быстрая задержка для инициализации драйвера
+        
+        # 2. Отпускаем механические тормоза (LOW = отпустить)
+        self.set_brakes(axes, engage=False)
+        time.sleep(0.5)  # Серьезная задержка для механического реле
+
+    def sleep_steppers(self, axes=['X', 'Y', 'Z']):
+        """Перевод в сон: зажимаем тормоза -> ждем реле -> снимаем ток удержания"""
+        if isinstance(axes, str): axes = [axes]
+            
+        # 1. Зажимаем механические тормоза (HIGH = зажать)
+        self.set_brakes(axes, engage=True)
+        time.sleep(0.5) # Ждем, пока реле щелкнет и заблокирует ось
+        
+        # 2. Снимаем ток с драйверов (HIGH = ВЫКЛ)
+        for ax in axes:
+            if ax in AXES_CONFIG:
+                try:
+                    GPIO.setup(AXES_CONFIG[ax]['en'], GPIO.OUT)
+                    GPIO.output(AXES_CONFIG[ax]['en'], GPIO.HIGH)
+                except Exception:
+                    pass
 
     # ================= ИСПОЛНЕНИЕ G-CODE =================
     def run_gcode(self, commands, v_max=None, a_max=None, is_resume=False):

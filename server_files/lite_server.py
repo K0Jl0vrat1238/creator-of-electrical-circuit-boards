@@ -22,6 +22,9 @@ from cnc_config import *
 class MotorRequest(BaseModel):
     state: bool = Field(..., description="Состояние мотора: true (вкл) или false (выкл)")
 
+class LightRequest(BaseModel):
+    state: int = Field(..., description="Состояние света: 0 (выкл) или 1 (вкл)")
+
 class MoveRequest(BaseModel):
     x: Optional[float] = None
     y: Optional[float] = None
@@ -45,7 +48,24 @@ class GcodeRequest(BaseModel):
     V_MAX: Optional[float] = None
     A_MAX: Optional[float] = None
 
-    
+class SleepRequest(BaseModel):
+    state: int = Field(..., description="0 - вывести из сна, 1 - перевести в сон (режим ожидания)")
+
+def verify_sleep_mode():
+    """Проверяет, не спит ли станок. Если спит - блокирует движение."""
+    if getattr(cnc, 'sleep_mode', False):
+        raise HTTPException(
+            status_code=400, 
+            detail="Выведите станок из режима ожидания"
+        )
+
+def verify_estop():
+    """Проверяет состояние E-Stop кнопки. Если зажата - выбрасывает 400 ошибку."""
+    if cnc.is_estop_pressed():
+        raise HTTPException(
+            status_code=400, 
+            detail="Взведите e-stop кнопку в раб. положение"
+        )    
 
 # ================= Настройки геометрии стола =================
 # Угол поворота картинки (в градусах). Положительный — против часовой, отрицательный — по часовой.
@@ -101,9 +121,15 @@ class MovePixelRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Здесь код, который выполняется при старте (если ничего не надо, просто пропускаем)
+    # Инициализируем кнопку E-Stop
+    cnc.init_global_hardware()
+    # Включаем свет
+    cnc.set_light_state(True)
+    
     yield
-    # А здесь — то, что сработает строго при выключении сервера
+    
+    cnc.set_light_state(False)
+    time.sleep(0.1)
     cnc.shutdown()
 
 app = FastAPI(title="CNC_Server", lifespan=lifespan)
@@ -470,6 +496,8 @@ def get_yoled_photo(
     
 @app.post("/api/v0/parking")
 def api_parking():
+    verify_estop()
+    verify_sleep_mode()
     if cnc.is_busy:
         raise HTTPException(status_code=400, detail="Станок сейчас занят другой операцией")
     cnc.is_busy = True
@@ -486,6 +514,8 @@ def api_parking():
     
 @app.post("/api/v0/move_absolute")
 def api_move_absolute(req: MoveRequest):
+    verify_estop()
+    verify_sleep_mode()
     if cnc.is_busy:
         raise HTTPException(status_code=400, detail="Станок сейчас занят другой операцией")
     if not cnc.is_homed:
@@ -503,6 +533,8 @@ def api_move_absolute(req: MoveRequest):
 
 @app.post("/api/v0/move_relative")
 def api_move_relative(req: MoveRequest):
+    verify_estop()
+    verify_sleep_mode()
     if cnc.is_busy:
         raise HTTPException(status_code=400, detail="Станок сейчас занят другой операцией")
     if not cnc.is_homed:
@@ -520,6 +552,8 @@ def api_move_relative(req: MoveRequest):
 
 @app.post("/api/v0/z_probe")
 def api_z_probe(req: ZProbeRequest):
+    verify_estop()
+    verify_sleep_mode()
     if cnc.is_busy:
         raise HTTPException(status_code=400, detail="Станок занят")
     if not cnc.is_homed:
@@ -543,6 +577,8 @@ def api_z_probe(req: ZProbeRequest):
 
 @app.post("/api/v0/run_gcode")
 def api_run_gcode(req: GcodeRequest):
+    verify_estop()
+    verify_sleep_mode()
     if cnc.is_busy: raise HTTPException(status_code=400, detail="Станок занят")
     if not cnc.is_homed: raise HTTPException(status_code=400, detail="Сперва выполните паркинг")
     cnc.is_busy = True
@@ -581,29 +617,8 @@ def api_get_limits():
 
 @app.post("/api/v0/stop")
 def api_stop():
-    cnc.pause = True
-    cnc.is_homed = False
-    cnc.z_probe_active = False
-    cnc.active_operation = None
-    cnc.interrupted_operation = None
-    cnc.resume_target = None
-    
-    # --- Сбрасываем мотор логически ---
-    cnc.motor_is_on = False
-    cnc.saved_motor_state = False
-    
-    # Полностью сбрасываем кэш пробинга при экстренном стопе
-    if hasattr(cnc, 'remaining_z_probe_points'):
-        cnc.remaining_z_probe_points = []
-    if hasattr(cnc, 'z_probe_results'):
-        cnc.z_probe_results = []
-    if hasattr(cnc, 'first_touch_z'):
-        cnc.first_touch_z = None
-    
-    cnc.gcode_commands = []
-    cnc.gcode_index = 0
-    
-    cnc.shutdown()
+    # Вызываем тот же метод, что и аппаратная кнопка
+    cnc.emergency_stop()
     
     return {
         "status": "stopped",
@@ -613,6 +628,7 @@ def api_stop():
 
 @app.post("/api/v0/pause")
 def api_pause():
+    verify_sleep_mode()
     if not cnc.is_homed:
         return {
             "status": "not_homed",
@@ -640,6 +656,8 @@ def api_pause():
 
 @app.post("/api/v0/resume")
 def api_resume():
+    verify_estop()
+    verify_sleep_mode()
     if cnc.is_busy:
         raise HTTPException(status_code=400, detail="Станок сейчас занят другой операцией")
     if not cnc.is_homed:
@@ -692,6 +710,8 @@ def api_resume():
         
 @app.post("/api/v0/move_pixel")
 def api_move_pixel(req: MovePixelRequest):
+    verify_estop()
+    verify_sleep_mode()
     if calibrator_model is None:
         raise HTTPException(status_code=500, detail="Модель калибровки не загружена на сервере")
     if cnc.is_busy:
@@ -751,6 +771,7 @@ def api_set_motor_state(req: MotorRequest):
     """
     Включает или выключает вращение шпинделя (true - включен, false - выключен).
     """
+    verify_estop()
     try:
         cnc.set_motor_state(req.state)
         status_text = "включен" if req.state else "выключен"
@@ -761,6 +782,40 @@ def api_set_motor_state(req: MotorRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка управления мотором: {str(e)}")
+
+@app.post("/api/v0/set_light_state")
+def api_set_light_state(req: LightRequest):
+    """
+    Включает (1) или выключает (0) LED подсветку станка.
+    """
+    try:
+        is_on = bool(req.state)
+        cnc.set_light_state(is_on)
+        return {
+            "status": "success", 
+            "message": f"Свет {'включен' if is_on else 'выключен'}",
+            "light_is_on": cnc.light_is_on
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка управления светом: {str(e)}")
+
+@app.post("/api/v0/sleep_mode")
+def api_sleep_mode(req: SleepRequest):
+    # E-Stop имеет приоритет, но если всё ок - разрешаем переключать
+    verify_estop() 
+    
+    is_sleep = bool(req.state)
+    
+    if is_sleep:
+        if cnc.is_busy:
+            raise HTTPException(status_code=400, detail="Станок работает, нельзя перевести в сон!")
+        cnc.sleep_steppers(['X', 'Y', 'Z'])
+        cnc.sleep_mode = True
+        return {"status": "success", "message": "Станок переведен в режим ожидания (тормоза зажаты)"}
+    else:
+        cnc.wake_up_steppers(['X', 'Y', 'Z'])
+        cnc.sleep_mode = False
+        return {"status": "success", "message": "Станок выведен из режима ожидания (тормоза разжаты)"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

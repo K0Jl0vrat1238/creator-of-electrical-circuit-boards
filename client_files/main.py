@@ -157,12 +157,23 @@ def run_headless_full(args: argparse.Namespace, target_ip: str) -> int:
             return 1
         window.machine_limits = limits
         
+        config = window._build_config() # Получаем конфиг, чтобы узнать состояние чекбоксов
+        
         logger.info("📸 Запрашиваю фото и разметку (fast)...")
+        if config.auto_light_on:
+            try: sync_req(target_ip, "set_light_state", data={"state": 1})
+            except: pass
+            
         try: sync_req(target_ip, "get_photo?camera=up&cut=true", method="GET")
         except: pass
         time.sleep(2)
         
         photo_data = sync_req(target_ip, "get_yoled_photo?camera=up&confidence_threshold=0.3&model_type=fast&cut=true", method="GET")
+        
+        if config.auto_light_off:
+            try: sync_req(target_ip, "set_light_state", data={"state": 0})
+            except: pass
+            
         conv = sync_req(target_ip, "pixels_to_mm_bulk", data={"segments": photo_data.get("segments", [])})
         
         window.placement_detections = photo_data.get("detections", [])
@@ -231,6 +242,12 @@ def main() -> int:
     parser.add_argument("--stop", action="store_true", help="Остановить станок")
     parser.add_argument("--pause", action="store_true", help="Поставить станок на паузу")
     parser.add_argument("--resume", action="store_true", help="Возобновить работу станка")
+
+    # Новые аргументы:
+    parser.add_argument("--sleep", action="store_true", help="Перевести станок в режим сна")
+    parser.add_argument("--wake", action="store_true", help="Разбудить станок")
+    parser.add_argument("--light-on", action="store_true", help="Включить свет")
+    parser.add_argument("--light-off", action="store_true", help="Выключить свет")
     
     parsed_args, qt_args = parser.parse_known_args()
     app = QApplication([sys.argv[0]] + qt_args)
@@ -270,6 +287,26 @@ def main() -> int:
         logger.info("🏠 Отправка команды парковки (--park)")
         start_headless_key_listener(target_ip)
         check_and_park(target_ip)
+        return 0
+
+    if parsed_args.sleep:
+        logger.info("💤 Отправка команды режима сна (--sleep)")
+        sync_req(target_ip, "sleep_mode", data={"state": 1})
+        return 0
+
+    if parsed_args.wake:
+        logger.info("☀️ Отправка команды пробуждения (--wake)")
+        sync_req(target_ip, "sleep_mode", data={"state": 0})
+        return 0
+        
+    if parsed_args.light_on:
+        logger.info("💡 Отправка команды включения света (--light-on)")
+        sync_req(target_ip, "set_light_state", data={"state": 1})
+        return 0
+        
+    if parsed_args.light_off:
+        logger.info("💡 Отправка команды выключения света (--light-off)")
+        sync_req(target_ip, "set_light_state", data={"state": 0})
         return 0
     # --------------------------------------------------
     

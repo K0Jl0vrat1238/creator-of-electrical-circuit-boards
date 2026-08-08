@@ -137,6 +137,9 @@ class PipelineConfig:
     trace_depth_mm: float
     green_depth_mm: float
     skip_validation: bool = False
+    # --- НОВЫЕ ПОЛЯ ---
+    auto_light_on: bool = True
+    auto_light_off: bool = True
 
     @classmethod
     def from_yaml(cls, path: Path, skip_validation: bool = False) -> PipelineConfig:
@@ -211,6 +214,8 @@ class PipelineConfig:
         drill_diams = [float(x) for x in drill_diams]
 
         override_validation = skip_validation or gcode.get("skip_validation", False)
+
+        camera_opts = data.get("camera", {})
         
         return cls(
             image_path=img_path,
@@ -227,7 +232,9 @@ class PipelineConfig:
             max_accel_mm_s2=float(gcode.get("max_accel_mm_s2", 500.0)),
             trace_depth_mm=float(gcode.get("trace_depth_mm", 0.2)),
             green_depth_mm=float(gcode.get("green_depth_mm", 0.1)),
-            skip_validation=override_validation
+            skip_validation=override_validation,
+            auto_light_on=camera_opts.get("auto_light_on", True),
+            auto_light_off=camera_opts.get("auto_light_off", True)
         )
 
 @dataclass(frozen=True)

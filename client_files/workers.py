@@ -92,10 +92,12 @@ class FetchWorker(QThread):
     failed = pyqtSignal(str)
     progress = pyqtSignal(str)
 
-    def __init__(self, ip_addr: str, model_type: str):
+    def __init__(self, ip_addr: str, model_type: str, auto_light_on: bool = True, auto_light_off: bool = True):
         super().__init__()
         self.ip_addr = ip_addr
         self.model_type = model_type
+        self.auto_light_on = auto_light_on
+        self.auto_light_off = auto_light_off
 
     def _sync_get(self, endpoint: str, timeout: float = 30) -> dict | bytes:
         url = f"http://{self.ip_addr}:8000/api/v0/{endpoint}"
@@ -119,9 +121,14 @@ class FetchWorker(QThread):
             res_json = json.loads(response.read().decode('utf-8'))
             logger.info(f"📥 [API Ответ] /{endpoint} | {_format_json(res_json)}")
             return res_json
-
+    
     def run(self):
         try:
+            # Мгновенно включаем свет перед работой камеры (без задержек)
+            if self.auto_light_on:
+                try: self._sync_post("set_light_state", {"state": 1}, timeout=5.0)
+                except Exception: pass
+
             self.progress.emit("Прогрев камеры...")
             try: self._sync_get("get_photo?camera=up&cut=true", timeout=10)
             except Exception: pass 
@@ -137,6 +144,11 @@ class FetchWorker(QThread):
             else:
                 self.progress.emit(f"Получение разметки ({self.model_type})...")
                 result_data = self._sync_get(f"get_yoled_photo?camera=up&confidence_threshold=0.3&model_type={self.model_type}&cut=true", timeout=80)
+
+            # Выключаем свет сразу после того, как фотка получена (без задержек)
+            if self.auto_light_off:
+                try: self._sync_post("set_light_state", {"state": 0}, timeout=5.0)
+                except Exception: pass
 
             self.progress.emit("Запрос лимитов станка...")
             try:

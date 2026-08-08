@@ -254,6 +254,35 @@ class MainWindow(QMainWindow):
         top_panel.addWidget(self.server_address_edit)
         # --- КОНЕЦ НОВОГО БЛОКА ПОДКЛЮЧЕНИЯ ---
 
+        top_panel.addSpacing(15)
+        
+        v_line2 = QFrame()
+        v_line2.setFrameShape(QFrame.VLine)
+        v_line2.setFrameShadow(QFrame.Sunken)
+        top_panel.addWidget(v_line2)
+        top_panel.addSpacing(10)
+
+        # Новые кнопки: Сон / Свет
+        btn_sleep = QPushButton("💤 Сон")
+        btn_sleep.setToolTip("Перевести станок в режим ожидания (зажать тормоза, отключить драйверы)")
+        btn_sleep.clicked.connect(lambda: self._set_sleep_mode(1))
+        top_panel.addWidget(btn_sleep)
+        
+        btn_wake = QPushButton("☀️ Разбудить")
+        btn_wake.setToolTip("Вывести станок из режима ожидания")
+        btn_wake.clicked.connect(lambda: self._set_sleep_mode(0))
+        top_panel.addWidget(btn_wake)
+        
+        btn_light_on = QPushButton("💡☀️")
+        btn_light_on.setToolTip("Включить подсветку")
+        btn_light_on.clicked.connect(lambda: self._set_light_state(1))
+        top_panel.addWidget(btn_light_on)
+        
+        btn_light_off = QPushButton("💡🌒")
+        btn_light_off.setToolTip("Выключить подсветку")
+        btn_light_off.clicked.connect(lambda: self._set_light_state(0))
+        top_panel.addWidget(btn_light_off)
+
         top_panel.addStretch()
         outer.addLayout(top_panel)
 
@@ -358,42 +387,55 @@ class MainWindow(QMainWindow):
     def _build_placement_tab(self, parent: QWidget) -> None:
         layout = QVBoxLayout(parent)
 
-        top_controls = QHBoxLayout()
-        top_controls.addWidget(QLabel("Модель:"))
+        top_controls_wrapper = QVBoxLayout()
+        
+        top_controls_row1 = QHBoxLayout()
+        top_controls_row1.addWidget(QLabel("Модель:"))
         self.combo_model = QComboBox()
         self.combo_model.addItems(["fast", "standart", "Без модели"])
         self.combo_model.setCurrentText("fast")
-        top_controls.addWidget(self.combo_model)
+        top_controls_row1.addWidget(self.combo_model)
 
         self.btn_fetch_photo = QPushButton("Получить фото")
         self.btn_fetch_photo.clicked.connect(self._fetch_placement_photo)
-        top_controls.addWidget(self.btn_fetch_photo)
+        top_controls_row1.addWidget(self.btn_fetch_photo)
 
         self.btn_select_pixel = QPushButton("🎯 Ехать в пиксель")
         self.btn_select_pixel.setCheckable(True)
         self.btn_select_pixel.setEnabled(False)
         self.btn_select_pixel.toggled.connect(self._on_select_pixel_toggled)
-        top_controls.addWidget(self.btn_select_pixel)
+        top_controls_row1.addWidget(self.btn_select_pixel)
 
         self.btn_start_placement = QPushButton("🧩 Разместить плату")
         self.btn_start_placement.setEnabled(False)
         self.btn_start_placement.setCheckable(True)
         self.btn_start_placement.toggled.connect(self._on_placement_toggled)
-        top_controls.addWidget(self.btn_start_placement)
+        top_controls_row1.addWidget(self.btn_start_placement)
 
         self.btn_auto_place = QPushButton("🤖 Авто-размещение")
         self.btn_auto_place.setEnabled(False)
         self.btn_auto_place.clicked.connect(self._on_auto_placement_clicked)
-        top_controls.addWidget(self.btn_auto_place)
+        top_controls_row1.addWidget(self.btn_auto_place)
 
         self.btn_fabricate = QPushButton("⚡ НАЧАТЬ ИЗГОТОВЛЕНИЕ")
         self.btn_fabricate.setEnabled(False)
         self.btn_fabricate.setStyleSheet("background-color: #0078D7; color: white; font-weight: bold;")
         self.btn_fabricate.clicked.connect(self._start_fabrication_workflow)
-        top_controls.addWidget(self.btn_fabricate)
-        top_controls.addStretch()
+        top_controls_row1.addWidget(self.btn_fabricate)
+        top_controls_row1.addStretch()
+        
+        top_controls_row2 = QHBoxLayout()
+        self.chk_light_on = QCheckBox("Включать свет перед фото")
+        self.chk_light_on.setChecked(True)
+        self.chk_light_off = QCheckBox("Выключать свет после фото")
+        self.chk_light_off.setChecked(True)
+        top_controls_row2.addWidget(self.chk_light_on)
+        top_controls_row2.addWidget(self.chk_light_off)
+        top_controls_row2.addStretch()
 
-        layout.addLayout(top_controls)
+        top_controls_wrapper.addLayout(top_controls_row1)
+        top_controls_wrapper.addLayout(top_controls_row2)
+        layout.addLayout(top_controls_wrapper)
 
         self.placement_tabs = QTabWidget()
         
@@ -609,7 +651,11 @@ class MainWindow(QMainWindow):
 
         self.btn_fetch_photo.setEnabled(False)
         self.btn_select_pixel.setEnabled(False)
-        worker = FetchWorker(ip, model_type)
+        worker = FetchWorker(
+            ip, model_type, 
+            auto_light_on=self.chk_light_on.isChecked(), 
+            auto_light_off=self.chk_light_off.isChecked()
+        )
         worker.success.connect(self._on_fetch_success)
         worker.failed.connect(self._on_fetch_failed)
         self._track_worker(worker)
@@ -1591,6 +1637,10 @@ class MainWindow(QMainWindow):
             
             if hasattr(config, 'plunge_speed_steps_s'):
                 self.plunge_speed_steps_s.setValue(config.plunge_speed_steps_s)
+
+            if hasattr(config, 'auto_light_on'):
+                self.chk_light_on.setChecked(config.auto_light_on)
+                self.chk_light_off.setChecked(config.auto_light_off)
         except Exception: pass
 
     def _build_config(self) -> PipelineConfig:
@@ -1610,7 +1660,9 @@ class MainWindow(QMainWindow):
             cut_speed_mm_s=float(self.cut_speed_steps_s.value()), plunge_speed_steps_s=float(self.plunge_speed_steps_s.value()),
             max_accel_mm_s2=float(self.max_accel_steps_s2.value()),
             trace_depth_mm=float(self.trace_depth_mm.value()), green_depth_mm=float(self.green_depth_mm.value()),
-            skip_validation=self._initial_skip_validation
+            skip_validation=self._initial_skip_validation,
+            auto_light_on=self.chk_light_on.isChecked(),
+            auto_light_off=self.chk_light_off.isChecked()
         )
 
     def _generate(self) -> None:
@@ -1738,19 +1790,37 @@ class MainWindow(QMainWindow):
         return None
     
     def _set_motor_state(self, is_on: bool) -> None:
-            if not self.is_homed:
-                self.log_human(False, "Ошибка: Невозможно управлять шпинделем, сперва выполните паркинг!")
-                return
+        if not self.is_homed:
+            self.log_human(False, "Ошибка: Невозможно управлять шпинделем, сперва выполните паркинг!")
+            return
 
-            ip = self.resolve_server_ip()
-            if not ip: 
-                return
+        ip = self.resolve_server_ip()
+        if not ip: 
+            return
 
-            payload = {"state": is_on}
-            worker = ApiWorker(f"http://{ip}:8000/api/v0/set_motor_state", "POST", payload, timeout=3.0)
-            
-            action_name = "Включение мотора" if is_on else "Выключение мотора"
-            
-            worker.success.connect(lambda d: self.log_human(True, f"{action_name} выполнено успешно."))
-            worker.failed.connect(lambda e: self.log_human(False, f"Ошибка сети при попытке изменить состояние мотора: {e}"))
-            self._track_worker(worker)
+        payload = {"state": is_on}
+        worker = ApiWorker(f"http://{ip}:8000/api/v0/set_motor_state", "POST", payload, timeout=3.0)
+        
+        action_name = "Включение мотора" if is_on else "Выключение мотора"
+        
+        worker.success.connect(lambda d: self.log_human(True, f"{action_name} выполнено успешно."))
+        worker.failed.connect(lambda e: self.log_human(False, f"Ошибка сети при попытке изменить состояние мотора: {e}"))
+        self._track_worker(worker)
+
+    def _set_sleep_mode(self, state: int) -> None:
+        ip = self.resolve_server_ip()
+        if not ip: return
+        worker = ApiWorker(f"http://{ip}:8000/api/v0/sleep_mode", "POST", {"state": state}, timeout=8.0)
+        action_name = "Режим сна" if state else "Пробуждение"
+        worker.success.connect(lambda d: self._on_command_success(d, action_name))
+        worker.failed.connect(lambda e: self._on_command_failed(e, action_name))
+        self._track_worker(worker)
+
+    def _set_light_state(self, state: int) -> None:
+        ip = self.resolve_server_ip()
+        if not ip: return
+        worker = ApiWorker(f"http://{ip}:8000/api/v0/set_light_state", "POST", {"state": state}, timeout=5.0)
+        action_name = "Включение света" if state else "Выключение света"
+        worker.success.connect(lambda d: self._on_command_success(d, action_name))
+        worker.failed.connect(lambda e: self._on_command_failed(e, action_name))
+        self._track_worker(worker)
