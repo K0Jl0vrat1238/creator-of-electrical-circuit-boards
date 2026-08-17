@@ -1,6 +1,7 @@
 import platform
 import re
 import socket
+import time
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
@@ -49,11 +50,16 @@ def get_ip_by_mac(mac_address):
     if ip:
         return ip
 
-    # Попытка 2: Кэш пуст — будим сеть и пингуем всех
-    ping_local_network()
-
-    # Попытка 3: Проверяем ARP-таблицу еще раз после обновления
-    return find_in_arp(mac_clean)
+    for _ in range(1, 6, 1):
+        # Кэш пуст — будим сеть и пингуем всех
+        ping_local_network()
+        time.sleep(0.5)
+        # Проверяем ARP-таблицу еще раз после обновления
+        ip = find_in_arp(mac_clean)
+        if ip:
+            return ip
+        
+    return None
 
 
 def find_in_arp(mac_clean):

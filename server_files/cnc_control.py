@@ -423,9 +423,10 @@ class CNCMachine:
         self.z_probe_v_max = None
         self.z_probe_a_max = None
         self.interrupted_operation = None
+        self.setup()
         self.set_motor_state(False)
         self.saved_motor_state = False
-        self.setup()
+        
 
         self.wake_up_steppers(['X', 'Y', 'Z'])
         self.sleep_mode = False
@@ -648,9 +649,16 @@ class CNCMachine:
                     raise RuntimeError("Z probing interrupted by Pause")
                 if self.red_crab_triggered:
                     return self.pos['Z'] / self.spm['Z']
-
+                
                 if not self.step('Z', GPIO.HIGH, 1.0 / V_MIN):
-                    raise RuntimeError("Z probing step failed")
+                    if self.red_crab_triggered:
+                        # Успели коснуться ровно между проверками! Возвращаем координату штатно.
+                        return self.pos['Z'] / self.spm['Z']
+                    if self.pause:
+                        raise RuntimeError("Z probing interrupted by Pause")
+                    
+                    raise RuntimeError("Z probing step failed due to unknown reason")
+                
                 self.pos['Z'] += 1
 
                 if self.red_crab_triggered:
@@ -803,7 +811,9 @@ class CNCMachine:
     def set_motor_state(self, is_on: bool):
         """Включает (True) или выключает (False) мотор"""
         if GPIO.getmode() is None:
-            return
+            GPIO.setmode(GPIO.BOARD)
+            GPIO.setwarnings(False)
+            
         self.motor_is_on = bool(is_on)
         
         # Если станок на паузе, мы просто запоминаем состояние, но физически мотор не крутим
@@ -811,18 +821,30 @@ class CNCMachine:
             self.saved_motor_state = self.motor_is_on
             return
             
-        GPIO.output(M_MOTOR, GPIO.LOW if self.motor_is_on else GPIO.HIGH)
+        try:
+            # Гарантируем, что пин - это ВЫХОД, даже если его сбросил стоп
+            GPIO.setup(M_MOTOR, GPIO.OUT)
+            GPIO.output(M_MOTOR, GPIO.LOW if self.motor_is_on else GPIO.HIGH)
+        except Exception:
+            pass
 
     def pause_motor(self):
         """Сохраняет состояние и выключает мотор при паузе"""
         self.saved_motor_state = self.motor_is_on
-        GPIO.output(M_MOTOR, GPIO.HIGH) # HIGH - это ВЫКЛ
+        try:
+            GPIO.setup(M_MOTOR, GPIO.OUT)
+            GPIO.output(M_MOTOR, GPIO.HIGH) # HIGH - это ВЫКЛ
+        except Exception:
+            pass
 
     def resume_motor(self):
         """Восстанавливает работу мотора после снятия с паузы"""
         self.motor_is_on = self.saved_motor_state
-        # Инвертированная логика
-        GPIO.output(M_MOTOR, GPIO.LOW if self.motor_is_on else GPIO.HIGH)
+        try:
+            GPIO.setup(M_MOTOR, GPIO.OUT)
+            GPIO.output(M_MOTOR, GPIO.LOW if self.motor_is_on else GPIO.HIGH)
+        except Exception:
+            pass
 
     def set_light_state(self, is_on: bool):
         """Управление подсветкой (LOW - включена, HIGH - выключена)"""

@@ -911,6 +911,8 @@ class MainWindow(QMainWindow):
                 worker = ApiWorker(f"http://{ip}:8000/api/v0/move_pixel", "POST", {"px_x": float(x), "px_y": float(y), "z": target_z, "diagonal": is_diag}, timeout=None)
                 worker.success.connect(lambda d: self._on_command_success(d, "Перемещение в пиксель"))
                 worker.failed.connect(lambda e: self._on_command_failed(e, "Перемещение в пиксель"))
+                self._track_worker(worker)
+                
             self._check_homing_and_execute(do_move)
 
     def _update_placement_buttons_state(self):
