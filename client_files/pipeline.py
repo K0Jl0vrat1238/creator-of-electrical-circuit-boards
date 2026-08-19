@@ -133,6 +133,10 @@ class PipelineConfig:
     stock_thickness_mm: float
     cut_speed_mm_s: float
     plunge_speed_steps_s: float
+    
+    rapid_speed_steps_s: float
+    rapid_accel_steps_s2: float
+    
     max_accel_mm_s2: float
     trace_depth_mm: float
     green_depth_mm: float
@@ -227,8 +231,12 @@ class PipelineConfig:
             simplify_tolerance_mm=float(tools.get("simplify_tolerance_mm", 0.0)),
             green_mode=tools.get("green_mode", "centerline"),
             stock_thickness_mm=float(gcode.get("stock_thickness_mm", 1.5)),
+            
             cut_speed_mm_s=float(gcode.get("cut_speed_mm_s", 20.0)),
-            plunge_speed_steps_s=float(gcode.get("plunge_speed_steps_s", 1500.0)),
+            plunge_speed_steps_s=float(gcode.get("plunge_speed_steps_s", 200.0)),
+            rapid_speed_steps_s=float(gcode.get("rapid_speed_steps_s", 30000.0)),
+            rapid_accel_steps_s2=float(gcode.get("rapid_accel_steps_s2", 15000.0)),
+
             max_accel_mm_s2=float(gcode.get("max_accel_mm_s2", 500.0)),
             trace_depth_mm=float(gcode.get("trace_depth_mm", 0.2)),
             green_depth_mm=float(gcode.get("green_depth_mm", 0.1)),

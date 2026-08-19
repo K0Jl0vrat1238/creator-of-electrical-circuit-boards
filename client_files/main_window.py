@@ -1280,7 +1280,8 @@ class MainWindow(QMainWindow):
         def step3():
             self.log_human(True, f"Снятие карты высот для отверстий ({len(points_mm)} точек)...")
             ip = self.resolve_server_ip()
-            payload = {"points": points_mm, "V_MAX": float(self.cut_speed_steps_s.value()), "A_MAX": float(self.max_accel_steps_s2.value())}
+            # Пробинг теперь использует параметры холостого хода
+            payload = {"points": points_mm, "V_MAX": float(self.rapid_speed_steps_s.value()), "A_MAX": float(self.rapid_accel_steps_s2.value())}
             worker = ApiWorker(f"http://{ip}:8000/api/v0/z_probe", "POST", payload, timeout=None)
             worker.success.connect(step4)
             worker.failed.connect(lambda e: self.log_human(False, f"Ошибка Z-пробинга: {e}"))
@@ -1292,28 +1293,31 @@ class MainWindow(QMainWindow):
         def step5():
             self._prompt_user("Запуск обработки", "ВНИМАНИЕ: Снимите крокодил автоуровня!\nНачать сверление?", step6)
         def step6():
-            gc = GCodeBuilder(feedrate=float(self.cut_speed_steps_s.value()))
+            gc = GCodeBuilder()
             gc.motor_on()
             
-            copper_thickness = float(self.trace_depth_mm.value())
-            plunge_f = (float(self.plunge_speed_steps_s.value()) / 800) * 60.0
-            cut_f = float(self.cut_speed_steps_s.value() / 800) * 60.0
+            # Перевод из шагов/сек в мм/мин для G-кода (сервер делит на 800)
+            plunge_f = (float(self.plunge_speed_steps_s.value()) / 800.0) * 60.0
             
             for p in points_mm:
                 x, y = p['x'], p['y']
                 z_surface = self._current_drill_z_map.get((x, y), 0.0)
-                safe_z = z_surface - 2.0  
+                
+                clearance_z = max(0.0, z_surface - 2.0)
                 target_z = z_surface + float(self.stock_thickness_mm.value()) + 0.5 
                 
-                gc.rapid(z=0)
-                gc.rapid(x=x, y=y)
-                # Применить новое раздельное опускание Z
-                _generate_plunge_gcode(gc, 0.0, target_z, z_surface, copper_thickness, plunge_f, cut_f)
-                gc.rapid(z=0)
+                gc.rapid(z=0)                       # Полностью поднимаем фрезу (Холостой ход)
+                gc.rapid(x=x, y=y)                  # Едем к точке (Холостой ход)
+                gc.rapid(z=clearance_z)             # Быстро опускаемся до 2 мм от платы
+                
+                gc.feed(z=target_z, f=plunge_f)     # Медленное сверление всей толщины
+                gc.feed(z=clearance_z, f=plunge_f)  # Медленное извлечение сверла
+                
+                gc.rapid(z=0)                       # Быстрый подъем
                 
             gc.motor_off()
             ip = self.resolve_server_ip()
-            payload = {"commands": gc.lines, "V_MAX": float(self.cut_speed_steps_s.value()), "A_MAX": float(self.max_accel_steps_s2.value())}
+            payload = {"commands": gc.lines, "V_MAX": float(self.rapid_speed_steps_s.value()), "A_MAX": float(self.rapid_accel_steps_s2.value())}
             worker = ApiWorker(f"http://{ip}:8000/api/v0/run_gcode", "POST", payload, timeout=None)
             worker.success.connect(lambda _: self._next_fab_step())
             worker.failed.connect(lambda e: self.log_human(False, f"Ошибка сверления: {e}"))
@@ -1332,7 +1336,7 @@ class MainWindow(QMainWindow):
                 return
             
             ip = self.resolve_server_ip()
-            payload = {"points": probe_pts, "V_MAX": float(self.cut_speed_steps_s.value()), "A_MAX": float(self.max_accel_steps_s2.value())}
+            payload = {"points": probe_pts, "V_MAX": float(self.rapid_speed_steps_s.value()), "A_MAX": float(self.rapid_accel_steps_s2.value())}
             worker = ApiWorker(f"http://{ip}:8000/api/v0/z_probe", "POST", payload, timeout=None)
             worker.success.connect(step4)
             worker.failed.connect(lambda e: self.log_human(False, f"Ошибка Z-пробинга: {e}"))
@@ -1358,30 +1362,41 @@ class MainWindow(QMainWindow):
             
         def step6():
             self.log_human(True, "Экспорт векторных путей в G-код и запуск фрезеровки...")
-            gc = GCodeBuilder(feedrate=float(self.cut_speed_steps_s.value()))
+            gc = GCodeBuilder()
             gc.motor_on()
             
-            copper_thickness = float(self.trace_depth_mm.value())
-            plunge_f = (float(self.plunge_speed_steps_s.value()) / 800) * 60.0
-            cut_f = float(self.cut_speed_steps_s.value() / 800) * 60.0
+            # Конвертация в мм/мин
+            plunge_f = (float(self.plunge_speed_steps_s.value()) / 800.0) * 60.0
+            cut_f = (float(self.cut_speed_steps_s.value()) / 800.0) * 60.0
             
             def add_paths(paths_px, depth):
                 for poly in paths_px:
                     if len(poly) < 2: continue
+                    
+                    # 1. Позиционирование к стартовой точке линии
                     mx, my = self._map_px_to_physical(poly[0][0], poly[0][1], pos, angle, scale, cx, cy)
                     z_surf = self._z_interpolator(mx, my)
+                    clearance_z = max(0.0, z_surf - 2.0)
+                    target_z = z_surf + depth
+                    
                     gc.rapid(z=0)
                     gc.rapid(x=mx, y=my)
+                    gc.rapid(z=clearance_z)             # Быстро спускаемся до 2 мм
+                    gc.feed(z=target_z, f=plunge_f)     # Медленно вгрызаемся в материал
                     
-                    target_z = z_surf + depth
-                    # Применить новое раздельное опускание Z
-                    _generate_plunge_gcode(gc, 0.0, target_z, z_surf, copper_thickness, plunge_f, cut_f)
-                    
+                    # 2. Фрезеровка контура на рабочей скорости
                     for px, py in poly[1:]:
                         nx, ny = self._map_px_to_physical(px, py, pos, angle, scale, cx, cy)
                         nz_surf = self._z_interpolator(nx, ny)
-                        gc.feed(x=nx, y=ny, z=nz_surf + depth, f=float(self.cut_speed_steps_s.value()))
-                    gc.rapid(z=0)
+                        gc.feed(x=nx, y=ny, z=nz_surf + depth, f=cut_f)
+                        
+                    # 3. Медленное извлечение в конце линии
+                    last_nx, last_ny = self._map_px_to_physical(poly[-1][0], poly[-1][1], pos, angle, scale, cx, cy)
+                    last_z_surf = self._z_interpolator(last_nx, last_ny)
+                    extract_clearance = max(0.0, last_z_surf - 2.0)
+                    
+                    gc.feed(z=extract_clearance, f=plunge_f) # Медленное извлечение
+                    gc.rapid(z=0)                            # Быстрый подъем в безопасную зону
 
             # 1. Изоляция дорожек (Black)
             depth_traces = float(self.trace_depth_mm.value()) * 1.01
@@ -1402,7 +1417,7 @@ class MainWindow(QMainWindow):
                 
             gc.motor_off()
             ip = self.resolve_server_ip()
-            payload = {"commands": gc.lines, "V_MAX": float(self.cut_speed_steps_s.value()), "A_MAX": float(self.max_accel_steps_s2.value())}
+            payload = {"commands": gc.lines, "V_MAX": float(self.rapid_speed_steps_s.value()), "A_MAX": float(self.rapid_accel_steps_s2.value())}
             worker = ApiWorker(f"http://{ip}:8000/api/v0/run_gcode", "POST", payload, timeout=None)
             worker.success.connect(lambda _: self._next_fab_step())
             worker.failed.connect(lambda e: self.log_human(False, f"Ошибка фрезеровки: {e}"))
@@ -1539,9 +1554,13 @@ class MainWindow(QMainWindow):
         form = QFormLayout(group)
         
         self.stock_thickness_mm = self._spin(0.001, 1000.0, 1.5, suffix=" мм")
-        self.cut_speed_steps_s = self._spin(0.001, 100000.0, 15000.0, suffix=" шаг/с", decimals=0)
-        self.plunge_speed_steps_s = self._spin(0.001, 100000.0, 1500.0, suffix=" шаг/с", decimals=0)
-        self.max_accel_steps_s2 = self._spin(0.001, 1000000.0, 10000.0, suffix=" шаг/с²", decimals=0)
+        
+        # Разделяем скорости
+        self.rapid_speed_steps_s = self._spin(0.001, 100000.0, 30000.0, suffix=" шаг/с", decimals=0)
+        self.rapid_accel_steps_s2 = self._spin(0.001, 1000000.0, 15000.0, suffix=" шаг/с²", decimals=0)
+        
+        self.cut_speed_steps_s = self._spin(0.001, 100000.0, 15000.0, suffix=" шаг/с (только рез)", decimals=0)
+        self.plunge_speed_steps_s = self._spin(0.001, 100000.0, 1500.0, suffix=" шаг/с (Z-ход)", decimals=0)
         
         self.trace_depth_mm = self._spin(0.001, 1000.0, 0.2, suffix=" мм")
         self.green_depth_mm = self._spin(0.001, 1000.0, 0.1, suffix=" мм")
@@ -1558,9 +1577,10 @@ class MainWindow(QMainWindow):
         motor_layout.addWidget(self.btn_motor_off)
         
         form.addRow("Толщина заготовки:", self.stock_thickness_mm)
-        form.addRow("Скорость реза:", self.cut_speed_steps_s)
-        form.addRow("Скорость погружения Z:", self.plunge_speed_steps_s)
-        form.addRow("Ускорение:", self.max_accel_steps_s2)
+        form.addRow("Скорость холостая (G0):", self.rapid_speed_steps_s)
+        form.addRow("Ускорение холостое:", self.rapid_accel_steps_s2)
+        form.addRow("Скорость реза (XY):", self.cut_speed_steps_s)
+        form.addRow("Скор. погружения/извлеч.:", self.plunge_speed_steps_s)
         form.addRow("Толщина меди:", self.trace_depth_mm)
         form.addRow("Глубина гравировки:", self.green_depth_mm)
         form.addRow("Шпиндель:", motor_layout)
@@ -1643,6 +1663,11 @@ class MainWindow(QMainWindow):
             if hasattr(config, 'auto_light_on'):
                 self.chk_light_on.setChecked(config.auto_light_on)
                 self.chk_light_off.setChecked(config.auto_light_off)
+                
+            if hasattr(config, 'rapid_speed_steps_s'):
+                self.rapid_speed_steps_s.setValue(config.rapid_speed_steps_s)
+                self.rapid_accel_steps_s2.setValue(config.rapid_accel_steps_s2)
+                
         except Exception: pass
 
     def _build_config(self) -> PipelineConfig:
@@ -1659,8 +1684,12 @@ class MainWindow(QMainWindow):
             drill_diameters_mm=diams,
             stepover_percent=float(self.stepover_percent.value()), simplify_tolerance_mm=float(self.simplify_tolerance_mm.value()),
             green_mode=mode, stock_thickness_mm=float(self.stock_thickness_mm.value()),
-            cut_speed_mm_s=float(self.cut_speed_steps_s.value()), plunge_speed_steps_s=float(self.plunge_speed_steps_s.value()),
-            max_accel_mm_s2=float(self.max_accel_steps_s2.value()),
+        
+            cut_speed_mm_s=float(self.cut_speed_steps_s.value()), 
+            plunge_speed_steps_s=float(self.plunge_speed_steps_s.value()),
+            rapid_speed_steps_s=float(self.rapid_speed_steps_s.value()),
+            rapid_accel_steps_s2=float(self.rapid_accel_steps_s2.value()),
+            max_accel_mm_s2=float(self.rapid_accel_steps_s2.value()),
             trace_depth_mm=float(self.trace_depth_mm.value()), green_depth_mm=float(self.green_depth_mm.value()),
             skip_validation=self._initial_skip_validation,
             auto_light_on=self.chk_light_on.isChecked(),

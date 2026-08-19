@@ -200,8 +200,8 @@ def run_headless_full(args: argparse.Namespace, target_ip: str) -> int:
         logger.info(f"📏 Запуск Z-пробинга ({len(points)} точек)...")
         payload = {
             "points": points,
-            "V_MAX": float(window.cut_speed_steps_s.value()),
-            "A_MAX": float(window.max_accel_steps_s2.value())
+            "V_MAX": float(window.rapid_speed_steps_s.value()),
+            "A_MAX": float(window.rapid_accel_steps_s2.value())
         }
         probe_res = sync_req(target_ip, "z_probe", data=payload)
         res_points = probe_res.get("points", [])
