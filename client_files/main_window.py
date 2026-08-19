@@ -52,36 +52,6 @@ class GCodeBuilder:
         if f is not None: parts.append(f"F{f}")
         if len(parts) > 1: self.lines.append(" ".join(parts))
 
-def _generate_plunge_gcode(gc: GCodeBuilder, start_z: float, target_z: float, z_surf: float, copper_thickness: float, plunge_f: float, cut_f: float) -> None:
-    """
-    Разбивает траекторию опускания оси Z на 3 сегмента:
-    1. Быстрый подвод (G0) до точки (z_surf - 0.5 мм).
-    2. Погружение через медь на скорости plunge_f до точки (z_surf + copper_thickness).
-    3. Достижение финальной точки на скорости резания cut_f.
-    """
-    if target_z <= start_z:
-        gc.rapid(z=target_z)
-        return
-
-    zone_start = z_surf - 0.5
-    zone_end = z_surf + copper_thickness
-
-    # Сегмент 1: Быстрый подвод до начала зоны медного слоя
-    if start_z < zone_start:
-        boundary = min(target_z, zone_start)
-        gc.rapid(z=boundary)
-        start_z = boundary
-
-    # Сегмент 2: Проход медного слоя с заданной скоростью погружения Z
-    if target_z > start_z and start_z < zone_end:
-        boundary = min(target_z, zone_end)
-        gc.feed(z=boundary, f=plunge_f)
-        start_z = boundary
-
-    # Сегмент 3: Движение на рабочей подаче резания ниже меди
-    if target_z > start_z:
-        gc.feed(z=target_z, f=cut_f)
-
 class MainWindow(QMainWindow):
     def __init__(self, skip_validation: bool = False) -> None:
         super().__init__()
@@ -1155,20 +1125,22 @@ class MainWindow(QMainWindow):
         # Сбор зон отверстий для их исключения из карты высот гравировки
         hole_exclusion_areas = []
         for d_mm, holes in drill_groups.items():
-            r_mm = (d_mm / 2.0) * 1.01
+            r_mm = (d_mm / 2.0) * 1.25 # Отступ +25%
             for h in holes:
                 mx, my = self._map_px_to_physical(h.x_px, h.y_px, pos, angle, scale, cx, cy)
                 hole_exclusion_areas.append((mx, my, r_mm))
 
         bbox = pcb_expanded.boundingRect()
-        grid_step = 10.0 
+        grid_step = 5.0 # Уменьшили шаг до 5.0 мм (полсантиметра)
         points = []
+        base_grid_count = 0
 
         for x in np.arange(bbox.left(), bbox.right() + grid_step, grid_step):
             for y in np.arange(bbox.top(), bbox.bottom() + grid_step, grid_step):
                 if not (l_min_x <= x <= l_max_x and l_min_y <= y <= l_max_y): continue
                 pt = QPointF(x, y)
                 if pcb_expanded.contains(pt) and blank_safe.contains(pt) and not danger_zone.contains(pt):
+                    base_grid_count += 1
                     in_hole = False
                     for hx, hy, hr in hole_exclusion_areas:
                         if math.hypot(x - hx, y - hy) <= hr:
@@ -1176,6 +1148,60 @@ class MainWindow(QMainWindow):
                             break
                     if not in_hole:
                         points.append({"x": round(float(x), 3), "y": round(float(y), 3)})
+                        
+        # Добиваем недостающие точки (чтобы сумма была равна ровно base_grid_count)
+        points_to_add = base_grid_count - len(points)
+        
+        if points_to_add > 0:
+            # Массив для быстрого вычисления дистанций
+            existing_pts = np.array([[p['x'], p['y']] for p in points]) if points else np.empty((0, 2))
+            attempts = 0
+            max_attempts = points_to_add * 50
+            
+            while points_to_add > 0 and attempts < max_attempts:
+                attempts += 1
+                
+                best_cand = None
+                max_min_dist = -1
+                
+                # Генерируем 10 кандидатов и выбираем того, кто ДАЛЬШЕ ВСЕХ от текущих точек
+                for _ in range(10): 
+                    rx = float(np.random.uniform(bbox.left(), bbox.right()))
+                    ry = float(np.random.uniform(bbox.top(), bbox.bottom()))
+                    
+                    if not (l_min_x <= rx <= l_max_x and l_min_y <= ry <= l_max_y): continue
+                    pt = QPointF(rx, ry)
+                    if not (pcb_expanded.contains(pt) and blank_safe.contains(pt) and not danger_zone.contains(pt)): continue
+                    
+                    in_hole = False
+                    for hx, hy, hr in hole_exclusion_areas:
+                        if math.hypot(rx - hx, ry - hy) <= hr:
+                            in_hole = True
+                            break
+                    if in_hole: continue
+                    
+                    cand_arr = np.array([rx, ry])
+                    if len(existing_pts) > 0:
+                        # Ищем расстояние до ближайшей существующей точки
+                        dists = np.sum((existing_pts - cand_arr)**2, axis=1)
+                        min_dist = np.min(dists)
+                    else:
+                        min_dist = float('inf')
+                        
+                    # Если этот кандидат дальше от соседних точек, чем предыдущий - берем его
+                    if min_dist > max_min_dist:
+                        max_min_dist = min_dist
+                        best_cand = cand_arr
+                        
+                if best_cand is not None:
+                    new_x, new_y = best_cand[0], best_cand[1]
+                    points.append({"x": round(float(new_x), 3), "y": round(float(new_y), 3)})
+                    if len(existing_pts) == 0:
+                        existing_pts = np.array([best_cand])
+                    else:
+                        existing_pts = np.vstack([existing_pts, best_cand])
+                    points_to_add -= 1
+
         return points
 
     def _generate_probe_points(self) -> list[dict]:
@@ -1273,10 +1299,51 @@ class MainWindow(QMainWindow):
             self.log_human(False, "Процесс прерван пользователем.")
             self.btn_fabricate.setEnabled(True)
 
+    def _prompt_tool_change(self, title, text, on_yes):
+        """Вызывает окно смены инструмента: усыпляет станок -> ждет юзера -> будит станок -> продолжает."""
+        ip = self.resolve_server_ip()
+        if not ip: return
+
+        def show_dialog(_):
+            msg = QMessageBox(self)
+            msg.setWindowTitle(title)
+            msg.setText(text)
+            msg.setIcon(QMessageBox.Information)
+            btn_ok = msg.addButton("✅ Выполнено", QMessageBox.AcceptRole)
+            btn_cancel = msg.addButton("❌ Отмена", QMessageBox.RejectRole)
+            msg.exec_()
+            
+            def wake_and_proceed(callback=None):
+                w = ApiWorker(f"http://{ip}:8000/api/v0/sleep_mode", "POST", {"state": 0}, timeout=8.0)
+                if callback: 
+                    # Ждем 1000 мс (1 сек) после успешного ответа сервера, прежде чем ехать дальше
+                    w.success.connect(lambda _: QTimer.singleShot(1000, callback))
+                w.failed.connect(lambda e: self.log_human(False, f"Ошибка пробуждения: {e}"))
+                self._track_worker(w)
+
+            if msg.clickedButton() == btn_ok:
+                self.log_human(True, "Пробуждение станка...")
+                wake_and_proceed(on_yes)
+            else:
+                self.log_human(False, "Процесс прерван пользователем.")
+                self.btn_fabricate.setEnabled(True)
+                # Даже при отмене всё равно будим станок, чтобы вернуть удержание моторов
+                wake_and_proceed()
+
+        def on_sleep_fail(e):
+            self.log_human(False, f"Не удалось усыпить станок: {e}. Процесс прерван ради безопасности.")
+            self.btn_fabricate.setEnabled(True)
+
+        self.log_human(True, "Переход в режим сна для безопасной смены инструмента...")
+        sleep_worker = ApiWorker(f"http://{ip}:8000/api/v0/sleep_mode", "POST", {"state": 1}, timeout=8.0)
+        sleep_worker.success.connect(show_dialog)
+        sleep_worker.failed.connect(on_sleep_fail)
+        self._track_worker(sleep_worker)
+    
     def _fab_drill_phase(self, diam_mm, points_mm):
         self.log_human(True, f"Этап сверления: диаметр {diam_mm} мм")
         def step2():
-            self._prompt_user("Смена инструмента", f"Установите СВЕРЛО {diam_mm} мм.\nПодключите крокодил автоуровня.", step3)
+            self._prompt_tool_change("Смена инструмента", f"Установите СВЕРЛО {diam_mm} мм.\nПодключите крокодил автоуровня.", step3)
         def step3():
             self.log_human(True, f"Снятие карты высот для отверстий ({len(points_mm)} точек)...")
             ip = self.resolve_server_ip()
@@ -1328,7 +1395,7 @@ class MainWindow(QMainWindow):
     def _fab_mill_phase(self, pos, angle, scale, cx, cy, drill_groups):
         self.log_human(True, "Этап фрезеровки контуров и проводников")
         def step2():
-            self._prompt_user("Смена инструмента", "Установите ГРАВЕР/ФРЕЗУ.\nПодключите крокодил автоуровня.", step3)
+            self._prompt_tool_change("Смена инструмента", "Установите ГРАВЕР/ФРЕЗУ.\nПодключите крокодил автоуровня.", step3)
         def step3():
             probe_pts = self._generate_mill_probe_points(pos, angle, scale, cx, cy, drill_groups)
             if not probe_pts:
@@ -1406,14 +1473,40 @@ class MainWindow(QMainWindow):
             depth_silk = float(self.green_depth_mm.value())
             add_paths(self._last_result.green_paths, depth_silk)
             
-            # 3. Обрезка контура (Red) с распределением по слоям заглубления
+            # 3. Обрезка контура (Red) с распределением по слоям (без лишних подъемов)
             stock = float(self.stock_thickness_mm.value())
-            max_pass = float(self.trace_depth_mm.value()) * 1.25
-            passes = math.ceil(stock / max_pass)
+            passes = int(self.cut_passes.value())
+            # Вычисляем точные глубины. Округление шагов возьмет на себя прошивка станка
             pass_depths = [(i + 1) * (stock / passes) for i in range(passes)]
             
-            for depth_cut in pass_depths:
-                add_paths(self._last_result.cut_paths, depth_cut)
+            for poly in self._last_result.cut_paths:
+                if len(poly) < 2: continue
+                
+                # Подвод к началу контура
+                mx, my = self._map_px_to_physical(poly[0][0], poly[0][1], pos, angle, scale, cx, cy)
+                z_surf = self._z_interpolator(mx, my)
+                clearance_z = max(0.0, z_surf - 2.0)
+                
+                gc.rapid(z=0)
+                gc.rapid(x=mx, y=my)
+                gc.rapid(z=clearance_z)
+                
+                for depth in pass_depths:
+                    # Опускаемся на нужную глубину
+                    gc.feed(z=z_surf + depth, f=plunge_f)
+                    
+                    # Обходим весь контур
+                    for px, py in poly[1:]:
+                        nx, ny = self._map_px_to_physical(px, py, pos, angle, scale, cx, cy)
+                        nz_surf = self._z_interpolator(nx, ny)
+                        gc.feed(x=nx, y=ny, z=nz_surf + depth, f=cut_f)
+                    
+                    # Контуры обрезки замкнуты, фреза вернулась ровно в точку старта.
+                    # На следующем проходе цикла она просто опустится глубже без поднятия!
+
+                # Только когда деталь вырезана полностью - извлекаем фрезу
+                gc.feed(z=clearance_z, f=plunge_f)
+                gc.rapid(z=0)
                 
             gc.motor_off()
             ip = self.resolve_server_ip()
@@ -1553,17 +1646,18 @@ class MainWindow(QMainWindow):
         group = QGroupBox("Параметры для создания G-кода")
         form = QFormLayout(group)
         
-        self.stock_thickness_mm = self._spin(0.001, 1000.0, 1.5, suffix=" мм")
+        self.stock_thickness_mm = self._spin(0.001, 1000.0, 1.6, suffix=" мм")
         
         # Разделяем скорости
         self.rapid_speed_steps_s = self._spin(0.001, 100000.0, 30000.0, suffix=" шаг/с", decimals=0)
         self.rapid_accel_steps_s2 = self._spin(0.001, 1000000.0, 15000.0, suffix=" шаг/с²", decimals=0)
         
-        self.cut_speed_steps_s = self._spin(0.001, 100000.0, 15000.0, suffix=" шаг/с (только рез)", decimals=0)
-        self.plunge_speed_steps_s = self._spin(0.001, 100000.0, 1500.0, suffix=" шаг/с (Z-ход)", decimals=0)
+        self.cut_speed_steps_s = self._spin(0.001, 100000.0, 450.0, suffix=" шаг/с (только рез)", decimals=0)
+        self.plunge_speed_steps_s = self._spin(0.001, 100000.0, 200.0, suffix=" шаг/с (Z-ход)", decimals=0)
         
-        self.trace_depth_mm = self._spin(0.001, 1000.0, 0.2, suffix=" мм")
+        self.trace_depth_mm = self._spin(0.001, 1000.0, 0.25, suffix=" мм")
         self.green_depth_mm = self._spin(0.001, 1000.0, 0.1, suffix=" мм")
+        self.cut_passes = self._spin(1.0, 100.0, 10.0, suffix=" проходов", decimals=0) # НОВОЕ
         
         self.trace_depth_mm.valueChanged.connect(lambda: self._validate_depths())
         self.green_depth_mm.valueChanged.connect(lambda: self._validate_depths())
@@ -1583,6 +1677,7 @@ class MainWindow(QMainWindow):
         form.addRow("Скор. погружения/извлеч.:", self.plunge_speed_steps_s)
         form.addRow("Толщина меди:", self.trace_depth_mm)
         form.addRow("Глубина гравировки:", self.green_depth_mm)
+        form.addRow("Проходов вырезания:", self.cut_passes) # НОВОЕ
         form.addRow("Шпиндель:", motor_layout)
         return group
 

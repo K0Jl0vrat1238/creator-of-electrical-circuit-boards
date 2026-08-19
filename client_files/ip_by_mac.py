@@ -1,84 +1,94 @@
-import platform
 import re
 import socket
-import time
 import subprocess
+import time
+import platform
 from concurrent.futures import ThreadPoolExecutor
 
-def ping_address(ip):
-    """Пингует один IP адрес в зависимости от ОС."""
-    param = "-n" if platform.system().lower() == "windows" else "-c"
-    # Отправляем всего 1 пакет и ставим минимальный таймаут, чтобы не ждать долго
-    command = ["ping", param, "1", "-w", "500", ip]
+def get_all_subnets():
+    """Собирает все подсети, к которым подключен компьютер (Wi-Fi, Docker, VirtualBox)."""
+    subnets = set()
+    
+    # 1. Смотрим, какие подсети уже "светятся" в таблице ARP (самый надежный метод)
     try:
-        subprocess.run(
-            command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
+        arp_output = subprocess.check_output(["arp", "-a"]).decode("cp866", errors="ignore")
+        for match in re.finditer(r"\s+(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}\s+", arp_output):
+            base = match.group(1) + "."
+            # Игнорируем мультикаст и системные сети
+            if not base.startswith(("224.", "239.", "255.", "127.")):
+                subnets.add(base)
+    except Exception:
+        pass
+
+    # 2. Дополнительно собираем все IP адреса самого компьютера
+    try:
+        _, _, ips = socket.gethostbyname_ex(socket.gethostname())
+        for ip in ips:
+            base = ".".join(ip.split(".")[:3]) + "."
+            if not base.startswith("127."):
+                subnets.add(base)
+    except Exception:
+        pass
+        
+    return subnets
+
+def _ping_ip(ip):
+    """Используем системный ping (ОС 100% отправит ARP-запрос). Черные консоли скрыты."""
+    try:
+        if platform.system().lower() == "windows":
+            # CREATE_NO_WINDOW флаг, чтобы не мерцали черные окошки
+            creation_flag = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+            subprocess.run(["ping", "-n", "1", "-w", "200", ip], 
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, 
+                           creationflags=creation_flag)
+        else:
+            subprocess.run(["ping", "-c", "1", "-W", "1", ip], 
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
 def ping_local_network():
-    """Определяет локальную подсеть и быстро пингует все IP в ней."""
-    try:
-        # Получаем локальный IP компа
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
+    """Сканирует ВСЕ найденные подсети в многопоточном режиме."""
+    subnets = get_all_subnets()
+    ip_list = []
+    for base in subnets:
+        ip_list.extend([f"{base}{i}" for i in range(1, 255)])
 
-        # Вычисляем маску /24 (самая частая для дома/офиса)
-        # Для полной точности нужен был бы psutil, но обойдемся базой: берем первые 3 октета
-        ip_parts = local_ip.split(".")
-        base_ip = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}."
+    if not ip_list:
+        return
 
-        # Генерируем пул IP-адресов от 1 до 254
-        ip_list = [f"{base_ip}{i}" for i in range(1, 255)]
-
-        # Запускаем пинг в 50 потоков, чтобы это заняло пару секунд, а не вечность
-        with ThreadPoolExecutor(max_workers=50) as executor:
-            executor.map(ping_address, ip_list)
-    except Exception:
-        # Если не удалось определить сеть, просто пропускаем шаг
-        pass
+    # Пингуем сотни адресов одновременно (займет около 1-2 секунд)
+    with ThreadPoolExecutor(max_workers=100) as executor:
+        executor.map(_ping_ip, ip_list)
 
 def get_ip_by_mac(mac_address):
-    # Нормализуем мак для поиска в любом формате
     mac_clean = mac_address.lower().replace("-", "").replace(":", "")
 
-    # Попытка 1: Ищем в текущем кэше
+    # Сначала проверяем кэш
     ip = find_in_arp(mac_clean)
     if ip:
         return ip
 
-    for _ in range(1, 6, 1):
-        # Кэш пуст — будим сеть и пингуем всех
+    # Если станка нет, будим ВСЕ локальные сети
+    for _ in range(3):
         ping_local_network()
-        time.sleep(0.5)
-        # Проверяем ARP-таблицу еще раз после обновления
+        time.sleep(0.5) # Даем винде время обновить ARP-кэш
         ip = find_in_arp(mac_clean)
         if ip:
             return ip
-        
+            
     return None
 
-
 def find_in_arp(mac_clean):
-    """Парсит ARP таблицу в поисках нужного мака."""
+    """Ищет MAC адрес в таблице ARP."""
     try:
-        arp_output = subprocess.check_output(["arp", "-a"]).decode(
-            "cp866", errors="ignore"
-        )
-        # Ищем строчку, где есть IP и наш очищенный MAC
+        arp_output = subprocess.check_output(["arp", "-a"]).decode("cp866", errors="ignore")
         for line in arp_output.splitlines():
             line_clean = line.lower().replace("-", "").replace(":", "")
             if mac_clean in line_clean:
-                # Выдергиваем первый попавшийся IP из этой строки
-                match = re.search(
-                    r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", line
-                )
+                match = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", line)
                 if match:
                     return match.group(1)
     except Exception:
         pass
     return None
-

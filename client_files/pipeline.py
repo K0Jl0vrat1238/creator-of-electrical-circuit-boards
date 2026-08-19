@@ -230,15 +230,15 @@ class PipelineConfig:
             stepover_percent=float(tools.get("stepover_percent", 50.0)),
             simplify_tolerance_mm=float(tools.get("simplify_tolerance_mm", 0.0)),
             green_mode=tools.get("green_mode", "centerline"),
-            stock_thickness_mm=float(gcode.get("stock_thickness_mm", 1.5)),
+            stock_thickness_mm=float(gcode.get("stock_thickness_mm", 1.6)),
             
-            cut_speed_mm_s=float(gcode.get("cut_speed_mm_s", 20.0)),
+            cut_speed_mm_s=float(gcode.get("cut_speed_mm_s", 450.0)),
             plunge_speed_steps_s=float(gcode.get("plunge_speed_steps_s", 200.0)),
             rapid_speed_steps_s=float(gcode.get("rapid_speed_steps_s", 30000.0)),
             rapid_accel_steps_s2=float(gcode.get("rapid_accel_steps_s2", 15000.0)),
 
             max_accel_mm_s2=float(gcode.get("max_accel_mm_s2", 500.0)),
-            trace_depth_mm=float(gcode.get("trace_depth_mm", 0.2)),
+            trace_depth_mm=float(gcode.get("trace_depth_mm", 0.25)),
             green_depth_mm=float(gcode.get("green_depth_mm", 0.1)),
             skip_validation=override_validation,
             auto_light_on=camera_opts.get("auto_light_on", True),
@@ -424,6 +424,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
 
     logger.info(f"Generating green layer (engraving) with mode: '{config.green_mode}'...")
     green_paths = _green_paths(masks["green"], hole_exclusion=hole_exclusion, tool_radius_px=green_tool_radius_px, stepover_px=green_stepover_px, mode=config.green_mode, simplify_tolerance_px=simplify_tolerance_px)
+    # --- ПРИМЕНЯЕМ ОПТИМИЗАЦИЮ ПУТЕЙ ---
+    green_paths = optimize_connected_paths(green_paths)
     logger.info("Generating copper trace isolation paths (black)...")
     black_paths = _black_paths(black_geometry, holes=holes, tool_radius_px=black_tool_radius_px, simplify_tolerance_px=simplify_tolerance_px)
     logger.info("Generating board outline paths (red)...")
@@ -816,3 +818,63 @@ def _merge_hole_clusters(holes: list[HoleCircle]) -> list[HoleCircle]:
             avg_y = sum(holes[idx].y_px for idx in cluster) / len(cluster)
             merged.append(HoleCircle(avg_x, avg_y, holes[cluster[0]].radius_px, holes[cluster[0]].color))
     return merged
+
+def optimize_connected_paths(paths: list[list[tuple[float, float]]]) -> list[list[tuple[float, float]]]:
+    """Объединяет пересекающиеся пути в единый непрерывный маршрут (обход графа с возвратом)."""
+    if not paths: return []
+    def rnd(pt): return (round(pt[0], 3), round(pt[1], 3))
+    
+    adj = {}
+    for i, poly in enumerate(paths):
+        if len(poly) < 2: continue
+        s, e = rnd(poly[0]), rnd(poly[-1])
+        if s not in adj: adj[s] = []
+        if e not in adj: adj[e] = []
+        adj[s].append((e, poly, i))
+        adj[e].append((s, poly[::-1], i))
+
+    visited_edges = set()
+    optimized_paths = []
+
+    for start_node in adj:
+        # Пропускаем, если все грани из этой точки уже посещены
+        if all(e[2] in visited_edges for e in adj[start_node]):
+            continue
+
+        current_path = []
+        # Стек: (текущая_точка, индекс_соседа, путь_по_которому_пришли)
+        stack = [(start_node, 0, None)]
+        
+        while stack:
+            curr_node, nbr_idx, edge_taken = stack.pop()
+            neighbors = adj[curr_node]
+            
+            next_edge = None
+            for i in range(nbr_idx, len(neighbors)):
+                if neighbors[i][2] not in visited_edges:
+                    next_edge = (i, neighbors[i])
+                    break
+                    
+            if next_edge:
+                i, (neighbor, poly_points, edge_idx) = next_edge
+                visited_edges.add(edge_idx)
+                
+                # Добавляем точки ребра в общий путь
+                if not current_path:
+                    current_path.extend(poly_points)
+                else:
+                    current_path.extend(poly_points[1:])
+                    
+                # Запоминаем, где остановились у текущей точки
+                stack.append((curr_node, i + 1, edge_taken))
+                # Переходим в новую точку
+                stack.append((neighbor, 0, poly_points))
+            else:
+                # Тупик. Возвращаемся обратно по тому же ребру
+                if edge_taken is not None:
+                    current_path.extend(edge_taken[::-1][1:])
+
+        if current_path:
+            optimized_paths.append(current_path)
+            
+    return optimized_paths
