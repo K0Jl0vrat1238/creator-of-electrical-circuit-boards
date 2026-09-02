@@ -106,7 +106,7 @@ class CNCMachine:
         GPIO.setwarnings(False)
         for axis in ['X', 'Y', 'Z']:
             cfg = AXES_CONFIG[axis]
-            GPIO.setup(cfg['endstop'], GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.setup(cfg['endstop'], GPIO.IN)
             
             try:
                 GPIO.remove_event_detect(cfg['endstop'])
@@ -121,7 +121,7 @@ class CNCMachine:
             GPIO.output(cfg['en'], GPIO.HIGH) 
 
         # ИЗМЕНЕНИЕ: Меняем PUD_UP на PUD_DOWN, так как в воздухе у нас LOW
-        GPIO.setup(RED_CRAB, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+        GPIO.setup(RED_CRAB, GPIO.IN)
         
         # Снимаем прерывание (если оно висело), но НЕ вешаем его заново!
         try:
