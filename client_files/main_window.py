@@ -1466,7 +1466,7 @@ class MainWindow(QMainWindow):
                     gc.rapid(z=0)                            # Быстрый подъем в безопасную зону
 
             # 1. Изоляция дорожек (Black)
-            depth_traces = float(self.trace_depth_mm.value()) * 1.01
+            depth_traces = float(self.trace_depth_mm.value())
             add_paths(self._last_result.black_paths, depth_traces)
             
             # 2. Текст / маркировка (Green)
