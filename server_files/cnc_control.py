@@ -41,40 +41,62 @@ class CNCMachine:
         self.current_feedrate = 600.0 # Скорость по умолчанию (мм/мин)
         
     def _endstop_callback(self, pin):
-        """Фоновый обработчик прерывания от процессора"""
+        """Фоновый обработчик прерывания от процессора с защитой от наводок"""
         if GPIO.getmode() is None:
             return 
             
         for axis, cfg in AXES_CONFIG.items():
             if cfg['endstop'] == pin:
                 time.sleep(0.002) 
+                
                 try:
-                    if GPIO.input(pin) == GPIO.LOW:
-                        self.endstop_triggered[axis] = True
+                    low_count = 0
+                    high_count = 0
+                    num_reads = 2000
+                    threshold = num_reads // 2
+                    
+                    for _ in range(num_reads):
+                        if GPIO.input(pin) == GPIO.LOW:
+                            low_count += 1
+                            # Если набрали половину + 1 — это точно нажатие, выходим
+                            if low_count > threshold:
+                                self.endstop_triggered[axis] = True
+                                break
+                        else:
+                            high_count += 1
+                            # Если набрали половину + 1 — это точно помеха, выходим
+                            if high_count > threshold:
+                                break
+                                
                 except RuntimeError:
                     pass 
+                
+                break
 
     def _red_crab_callback(self, pin):
         """Interrupt callback for the PCB touch probe."""
         if GPIO.getmode() is None or not self.z_probe_active:
             return
 
-        # Сильно уменьшаем первичную паузу до 0.5 миллисекунды (просто чтобы прошел первый пик искры)
         time.sleep(0.002) 
         
         try:
             high_count = 0
+            low_count = 0
             num_reads = 5000
+            threshold = num_reads // 2
             
-            # Делаем 100 быстрых замеров состояния пина подряд
             for _ in range(num_reads):
                 if GPIO.input(pin) == GPIO.HIGH:
                     high_count += 1
-            
-            # Голосование: если состояние HIGH было зафиксировано больше чем в половине случаев
-            if high_count > (num_reads / 2):
-                self.red_crab_triggered = True
-                
+                    if high_count > threshold:
+                        self.red_crab_triggered = True
+                        break
+                else:
+                    low_count += 1
+                    if low_count > threshold:
+                        break
+                        
         except RuntimeError:
             pass
 
@@ -200,44 +222,52 @@ class CNCMachine:
         self.shutdown()
 
     def _estop_callback(self, pin):
-        """Аппаратное прерывание от физической кнопки E-Stop (с защитой от наводок)"""
+        """Аппаратное прерывание от физической кнопки E-Stop"""
         if GPIO.getmode() is None:
             return
             
-        # Пропускаем фронт возможной высокочастотной помехи
         time.sleep(0.002) 
         
         try:
             low_count = 0
-            num_reads = 500  # Делаем 500 замеров
+            high_count = 0
+            num_reads = 500
+            threshold = num_reads // 2
             
-            # Читаем пин пулеметом
             for _ in range(num_reads):
                 if GPIO.input(pin) == GPIO.LOW:
                     low_count += 1
-            
-            # Голосование: если состояние LOW было зафиксировано больше чем в половине случаев
-            if low_count > (num_reads / 2):
-                # Это точно не помеха, глушим станок!
-                self.emergency_stop()
-                
+                    if low_count > threshold:
+                        self.emergency_stop()
+                        break
+                else:
+                    high_count += 1
+                    if high_count > threshold:
+                        break
+                        
         except RuntimeError:
             pass
 
     def is_estop_pressed(self) -> bool:
-        """Возвращает True, если E-Stop кнопка зажата (с защитой от ложных срабатываний)"""
+        """Возвращает True, если E-Stop кнопка зажата"""
         if GPIO.getmode() is None:
             return False
         try:
             low_count = 0
+            high_count = 0
             num_reads = 500
+            threshold = num_reads // 2
             
             for _ in range(num_reads):
                 if GPIO.input(STOP_BUTTON_PIN) == GPIO.LOW:
                     low_count += 1
-                    
-            # Возвращаем True только если кнопка уверенно и стабильно прижата к земле
-            return low_count > (num_reads / 2)
+                    if low_count > threshold:
+                        return True
+                else:
+                    high_count += 1
+                    if high_count > threshold:
+                        return False
+            return False
         except Exception:
             return False
 

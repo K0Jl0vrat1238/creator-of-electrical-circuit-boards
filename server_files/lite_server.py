@@ -497,7 +497,7 @@ def get_yoled_photo(
 @app.post("/api/v0/parking")
 def api_parking():
     verify_estop()
-    verify_sleep_mode()
+    # verify_sleep_mode()
     if cnc.is_busy:
         raise HTTPException(status_code=400, detail="Станок сейчас занят другой операцией")
     cnc.is_busy = True
